@@ -89,6 +89,8 @@ pub fn shell(
         shell_cylinder(body, &shape, &removed, distance)?
     } else if let Some(shape) = recognize_sphere(body) {
         shell_sphere(body, &shape, &removed, distance)?
+    } else if let Some(result) = shell_prismatic(body, &removed, distance) {
+        result?
     } else {
         shell_polyhedral(body, &removed, distance)?
     };
@@ -319,6 +321,213 @@ fn shell_sphere(
     subtract(outer, cavity, body)
 }
 
+/// A solid run straight between two parallel caps — its walls planes and
+/// cylinders square to them, a plate with holes, a wall bent round an arc:
+/// the cavity is the cap's region offset in by the thickness, run between
+/// the caps moved in, or out through a removed cap. Offset in the plane,
+/// a wall narrower than the shell closes up there and a hole's wall grows
+/// round it as the region allows. Not taken (`None`) for any other solid, or
+/// where a wall is to be opened.
+#[cfg(feature = "offset")]
+fn shell_prismatic(
+    body: &Body,
+    removed: &HashSet<FaceKey>,
+    distance: f64,
+) -> Option<Result<Body, ShellError>> {
+    use crate::geom2d::{Curve, Polyline};
+    let outward = |face: FaceKey| -> Option<Vec3> {
+        let node = body.faces.get(face)?;
+        let Some(Surface::Plane(plane)) = body.surfaces.get(node.surface) else {
+            return None;
+        };
+        Some(Vec3::from(plane.normal()?) * if node.forward { 1.0 } else { -1.0 })
+    };
+    // The caps: a plane, the one plane facing the other way, and walls
+    // square to both.
+    let caps = body.face_keys().find_map(|top| {
+        let normal = outward(top)?;
+        let mut bottom = None;
+        for face in body.face_keys().filter(|face| *face != top) {
+            match body.faces.get(face).and_then(|node| body.surfaces.get(node.surface))? {
+                Surface::Plane(_) => {
+                    let along = outward(face)?.dot(normal);
+                    if along < -1.0 + 1e-9 && bottom.is_none() {
+                        bottom = Some(face);
+                    } else if along.abs() > 1e-9 {
+                        return None;
+                    }
+                }
+                Surface::Cylinder(cylinder) => {
+                    if Vec3::from(cylinder.base.normal()?).dot(normal).abs() < 1.0 - 1e-9 {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some((top, bottom?, normal))
+    });
+    let (top, bottom, normal) = caps?;
+    if removed.iter().any(|face| *face != top && *face != bottom) {
+        return None;
+    }
+    let profile = super::planar_face_profile(body, top)?;
+    let floor = body.faces.get(bottom).and_then(|node| body.surfaces.get(node.surface));
+    let Some(Surface::Plane(floor)) = floor else {
+        return None;
+    };
+    let height = (Vec3::from(profile.plane.origin) - Vec3::from(floor.origin)).dot(normal);
+    let rings = profile.loops.iter().map(|ring| ring_polyline(ring)).collect::<Option<Vec<_>>>()?;
+    let tolerance = super::operation_tolerance(&[body]);
+    let thickness = distance.abs();
+    let region: Vec<Curve> = rings.iter().cloned().map(Curve::Polyline).collect();
+    let in_region = |point: [f64; 2]| {
+        crate::geom2d::contains(&region, point, crate::geom2d::Tolerance::new(tolerance))
+    };
+    // Each ring moved off its material, or into it.
+    let moved = |ring: &Polyline, into: bool| -> Vec<Polyline> {
+        let curve = Curve::Polyline(ring.clone());
+        let pieces = curve.segment_count().max(1) as f64;
+        let (at, ahead) = (curve.point_at(0.5 / pieces), curve.point_at(0.5 / pieces + 1e-6));
+        let along = [ahead[0] - at[0], ahead[1] - at[1]];
+        let length = along[0].hypot(along[1]);
+        if length == 0.0 {
+            return Vec::new();
+        }
+        let reach = thickness * 1e-3;
+        let left = [at[0] - along[1] / length * reach, at[1] + along[0] / length * reach];
+        let right = [at[0] + along[1] / length * reach, at[1] - along[0] / length * reach];
+        let side = if in_region(left) == into { left } else { right };
+        crate::geom2d::offset_polyline(ring, thickness, side)
+    };
+    // A region's ring run along the cap's normal between two depths below
+    // the top cap.
+    let run = |ring: &Polyline, from: f64, to: f64| -> Option<Body> {
+        let mut plane = profile.plane;
+        plane.origin = (Vec3::from(plane.origin) - normal * from).to_array();
+        let along = (normal * (from - to)).to_array();
+        super::extrude_region(plane, &[vec![Curve::Polyline(ring.clone())]], along)
+    };
+    // The region of `outer` rings less `holes` rings, run between depths.
+    let solid = |outer: &[Polyline], holes: &[Polyline], from: f64, to: f64| -> Option<Body> {
+        let mut pieces = outer.iter().map(|ring| run(ring, from, to));
+        let mut result = pieces.next()??;
+        for piece in pieces {
+            result = super::combine(result, piece?, Operation::Union, tolerance).ok()?;
+        }
+        for hole in holes {
+            result = super::combine(result, run(hole, from, to)?, Operation::Difference, tolerance)
+                .ok()?;
+        }
+        Some(result)
+    };
+    let (open_top, open_bottom) = (removed.contains(&top), removed.contains(&bottom));
+    let through = thickness * 2.0;
+    let built = if distance > 0.0 {
+        let outer = moved(&rings[0], true);
+        if outer.is_empty() {
+            return Some(Err(ShellError::NoMaterial));
+        }
+        let holes: Vec<Polyline> = rings[1..].iter().flat_map(|ring| moved(ring, true)).collect();
+        let (from, to) = (
+            if open_top { -through } else { thickness },
+            if open_bottom { height + through } else { height - thickness },
+        );
+        if to <= from {
+            return Some(Err(ShellError::NoMaterial));
+        }
+        solid(&outer, &holes, from, to).map(|cavity| (body.clone(), cavity))
+    } else {
+        let outer = moved(&rings[0], false);
+        let holes: Vec<Polyline> = rings[1..].iter().flat_map(|ring| moved(ring, false)).collect();
+        let exterior = solid(&outer, &holes, -thickness, height + thickness);
+        let cavity = if removed.is_empty() {
+            Some(body.clone())
+        } else {
+            solid(
+                &rings[..1],
+                &rings[1..],
+                if open_top { -through - thickness } else { 0.0 },
+                if open_bottom { height + through + thickness } else { height },
+            )
+        };
+        exterior.zip(cavity)
+    };
+    let Some((exterior, cavity)) = built else {
+        return Some(Err(ShellError::UnsupportedSolid));
+    };
+    Some(hollowed(exterior, cavity, body, removed.is_empty()))
+}
+
+#[cfg(not(feature = "offset"))]
+fn shell_prismatic(_: &Body, _: &HashSet<FaceKey>, _: f64) -> Option<Result<Body, ShellError>> {
+    None
+}
+
+/// A profile ring as one closed polyline, arcs as bulges. `None` for a
+/// piece neither straight nor round, or a ring that does not close.
+#[cfg(feature = "offset")]
+fn ring_polyline(ring: &[crate::geom2d::Curve]) -> Option<crate::geom2d::Polyline> {
+    use crate::geom2d::{Curve, PolylineVertex};
+    let pieces = super::extrusion_profile_pieces(ring);
+    let ends = |piece: &Curve| (piece.point_at(0.0), piece.point_at(1.0));
+    let size = pieces
+        .iter()
+        .flat_map(|piece| [ends(piece).0, ends(piece).1])
+        .fold(0.0f64, |big, p| big.max(p[0].abs()).max(p[1].abs()));
+    let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= 1e-9 * (1.0 + size);
+    let first = pieces.first()?;
+    let next = pieces.get(1).unwrap_or(first);
+    let (a, b) = ends(first);
+    let mut at = if near(b, ends(next).0) || near(b, ends(next).1) { a } else { b };
+    let start = at;
+    let mut vertices = Vec::with_capacity(pieces.len());
+    for piece in &pieces {
+        let (from, to) = ends(piece);
+        let forward = if near(from, at) {
+            true
+        } else if near(to, at) {
+            false
+        } else {
+            return None;
+        };
+        let bulge = match piece {
+            Curve::Line(_) => 0.0,
+            Curve::Arc(arc) => {
+                let turn = (arc.sweep() / 4.0).tan();
+                if forward { turn } else { -turn }
+            }
+            _ => return None,
+        };
+        vertices.push(PolylineVertex { position: at, bulge });
+        at = if forward { to } else { from };
+    }
+    near(at, start).then_some(crate::geom2d::Polyline { vertices, closed: true })
+}
+
+/// The exterior less the cavity, a closed one checked to take exactly its
+/// own volume out.
+fn hollowed(
+    exterior: Body,
+    cavity: Body,
+    reference: &Body,
+    closed: bool,
+) -> Result<Body, ShellError> {
+    let hollow = subtract(exterior.clone(), cavity.clone(), reference)?;
+    if closed {
+        let volume = |body: &Body| super::mass_properties(body).map(|mass| mass.volume);
+        let (whole, inner, left) = (
+            volume(&exterior).ok_or(ShellError::NoMaterial)?,
+            volume(&cavity).ok_or(ShellError::NoMaterial)?,
+            volume(&hollow).ok_or(ShellError::NoMaterial)?,
+        );
+        if (whole - inner - left).abs() > 1e-6 * whole.abs() {
+            return Err(ShellError::NoMaterial);
+        }
+    }
+    Ok(hollow)
+}
+
 /// Any solid bounded by planes alone: the cavity is the solid with every
 /// face moved in by the thickness — each corner where its faces' moved
 /// planes meet — and every removed face moved out instead, so the cavity
@@ -367,20 +576,7 @@ fn shell_polyhedral(
         let cavity = offset_planes(body, &through).ok_or(ShellError::NoMaterial)?;
         (outer, cavity)
     };
-    let hollow = subtract(outer.clone(), cavity.clone(), body)?;
-    // A closed cavity takes exactly its own volume out of the exterior.
-    if removed.is_empty() {
-        let volume = |body: &Body| super::mass_properties(body).map(|mass| mass.volume);
-        let (whole, inner, left) = (
-            volume(&outer).ok_or(ShellError::NoMaterial)?,
-            volume(&cavity).ok_or(ShellError::NoMaterial)?,
-            volume(&hollow).ok_or(ShellError::NoMaterial)?,
-        );
-        if (whole - inner - left).abs() > 1e-6 * whole.abs() {
-            return Err(ShellError::NoMaterial);
-        }
-    }
-    Ok(hollow)
+    hollowed(outer, cavity, body, removed.is_empty())
 }
 
 /// `body`, every face moved along its outward normal by `shift` of it and
@@ -685,6 +881,40 @@ mod tests {
     use super::*;
     use crate::brep::{analytic_mass_properties, make};
     use std::f64::consts::PI;
+
+    #[test]
+    fn a_plate_with_two_holes_hollows_round_them() {
+        // A 10 × 6 plate a unit thick with two unit holes. Moved in a
+        // tenth, its region is 9.8 × 5.8 less two holes of 1.1; grown, its
+        // walls moved out to meet sharp, 10.2 × 6.2 less holes of 0.9.
+        let mut plate = make::cuboid([0.0, 0.0, 0.0], [10.0, 6.0, 1.0]).unwrap();
+        for x in [3.0, 7.0] {
+            let hole = make::cylinder([x, 3.0, -1.0], 1.0, 3.0).unwrap();
+            plate = crate::brep::combine(plate, hole, Operation::Difference, 1e-9).unwrap();
+        }
+        let volume = |body: &Body| crate::brep::mass_properties(body).unwrap().volume;
+        let solid = 60.0 - 2.0 * PI;
+        let shrunk = 9.8 * 5.8 - 2.0 * PI * 1.21;
+        let grown = 10.2 * 6.2 - 2.0 * PI * 0.81;
+        let top = plate
+            .face_keys()
+            .find(|face| {
+                let node = plate.faces.get(*face).unwrap();
+                matches!(plate.surfaces.get(node.surface), Some(Surface::Plane(plane))
+                    if (plane.origin[2] - 1.0).abs() < 1e-9)
+            })
+            .unwrap();
+        for (removed, distance, expected) in [
+            (vec![], 0.1, solid - shrunk * 0.8),
+            (vec![top], 0.1, solid - shrunk * 0.9),
+            (vec![], -0.1, grown * 1.2 - solid),
+        ] {
+            let hollow = shell(&plate, &removed, distance).unwrap();
+            assert!(hollow.validate().is_empty());
+            let got = volume(&hollow);
+            assert!((got - expected).abs() < 1e-4 * expected, "{distance}: {got} {expected}");
+        }
+    }
 
     #[test]
     fn an_l_shaped_block_hollows_closed_open_and_outward() {
