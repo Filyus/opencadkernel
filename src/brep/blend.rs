@@ -298,6 +298,7 @@ pub fn chamfer_edges(
             | ChamferError::UnsupportedExistingFillet
             | ChamferError::UnsupportedBodySurface
             | ChamferError::DistanceTooLargeOrInteracting
+            | ChamferError::UnsupportedEdgeCurve(_)
             | ChamferError::InvalidResult),
         ) => {
             let bevel = Section::Bevel { base_face, base: base_distance, other: other_distance };
@@ -632,7 +633,8 @@ pub fn fillet_edges(
         None => Err(error),
     };
     // Last, the edge rounded by a boolean: whatever else the body is, the
-    // corner between two planes and the rolling cylinder is a prism.
+    // corner between two planes and the rolling cylinder is a prism — or,
+    // round a plane's circle on a cylinder or cone, a ring.
     match local {
         Err(
             error @ (FilletError::UnsupportedBodyTopology
@@ -641,6 +643,7 @@ pub fn fillet_edges(
             | FilletError::UnsupportedBodySurface
             | FilletError::UnsupportedEndCondition(_)
             | FilletError::RadiusTooLargeOrInteracting
+            | FilletError::UnsupportedEdgeCurve(_)
             | FilletError::InvalidResult),
         ) => blend_by_cut(body, &selected, Section::Round(radius)).ok_or(error),
         result => result,
@@ -661,33 +664,195 @@ enum Section {
 /// one. `None` unless the section rests on both faces along every edge.
 fn blend_by_cut(body: &Body, selected: &[EdgeKey], section: Section) -> Option<Body> {
     let tolerance = operation_tolerance(&[body]);
-    // Each boolean renames the edges; they are found again by their ends.
-    let ends: Vec<(Vec3, Vec3)> = selected
+    // Each boolean renames the edges; they are found again by their ends,
+    // and a circle by its centre and radius as well.
+    let marks: Vec<(Vec3, Vec3, Option<(Vec3, f64)>)> = selected
         .iter()
         .map(|edge| {
             let edge = body.edges.get(*edge)?;
+            let ring = match body.curves.get(edge.curve)? {
+                Curve3::Circle(circle) => Some((Vec3::from(circle.plane.origin), circle.radius)),
+                _ => None,
+            };
             Some((
                 Vec3::from(body.vertices.get(edge.start)?.point),
                 Vec3::from(body.vertices.get(edge.end)?.point),
+                ring,
             ))
         })
         .collect::<Option<_>>()?;
     let mut result = body.clone();
-    for (start, end) in ends {
+    for (start, end, ring) in marks {
+        let near = |p: Vec3, q: Vec3| p.distance(q) <= tolerance * 10.0;
         // A straight one: an arc may join the same two corners.
         let edge = result.edges.iter().find_map(|(key, edge)| {
-            if !matches!(result.curves.get(edge.curve)?, Curve3::Line(_)) {
-                return None;
+            match (result.curves.get(edge.curve)?, ring) {
+                (Curve3::Line(_), None) => {}
+                (Curve3::Circle(circle), Some((centre, radius)))
+                    if near(Vec3::from(circle.plane.origin), centre)
+                        && (circle.radius - radius).abs() <= tolerance * 10.0 => {}
+                _ => return None,
             }
             let a = Vec3::from(result.vertices.get(edge.start)?.point);
             let b = Vec3::from(result.vertices.get(edge.end)?.point);
-            let near = |p: Vec3, q: Vec3| p.distance(q) <= tolerance * 10.0;
             ((near(a, start) && near(b, end)) || (near(a, end) && near(b, start)))
                 .then_some(key)
         })?;
-        result = cut_along_edge(&result, edge, section, tolerance)?;
+        result = match ring {
+            None => cut_along_edge(&result, edge, section, tolerance)?,
+            Some(_) => turn_along_edge(&result, edge, section, tolerance)?,
+        };
     }
     Some(result)
+}
+
+/// [`cut_along_edge`] round a circle where a plane square to its axis meets
+/// a cylinder or cone about it — a hole's rim, a boss's, a countersink's —
+/// the same section swept round the axis over the edge's span rather than
+/// along a line.
+fn turn_along_edge(
+    body: &Body,
+    edge_key: EdgeKey,
+    section: Section,
+    tolerance: f64,
+) -> Option<Body> {
+    let edge = body.edges.get(edge_key)?;
+    let curve = body.curves.get(edge.curve)?;
+    let Curve3::Circle(circle) = curve else {
+        return None;
+    };
+    let span = edge.end_parameter - edge.start_parameter;
+    if edge.coedges.len() != 2 || !(span > 0.0 && span <= TAU + 1e-9) {
+        return None;
+    }
+    let centre = Vec3::from(circle.plane.origin);
+    let axis = Vec3::from(circle.plane.normal()?);
+    let face_of = |coedge| Some(body.loops.get(body.coedges.get(coedge)?.owner)?.owner);
+    let faces = [face_of(edge.coedges[0])?, face_of(edge.coedges[1])?];
+    let square = faces.iter().all(|face| {
+        match body.faces.get(*face).and_then(|node| body.surfaces.get(node.surface)) {
+            Some(Surface::Plane(plane)) => plane
+                .normal()
+                .is_some_and(|normal| Vec3::from(normal).cross(axis).length() <= 1e-9),
+            Some(Surface::Cylinder(cylinder)) => {
+                let own = cylinder.base.normal().map(Vec3::from);
+                let offset = Vec3::from(cylinder.base.origin) - centre;
+                own.is_some_and(|own| own.cross(axis).length() <= 1e-9)
+                    && (offset - axis * offset.dot(axis)).length() <= tolerance * 10.0
+                    && (cylinder.radius - circle.radius).abs() <= tolerance * 10.0
+            }
+            // A countersink's: straight in the plane through the axis too.
+            Some(Surface::Cone(cone)) => {
+                let own = cone.base.normal().map(Vec3::from);
+                let offset = Vec3::from(cone.base.origin) - centre;
+                own.is_some_and(|own| own.cross(axis).length() <= 1e-9)
+                    && (offset - axis * offset.dot(axis)).length() <= tolerance * 10.0
+            }
+            _ => false,
+        }
+    });
+    if !square {
+        return None;
+    }
+    // Outward, at a point of the edge: in the plane through the axis there.
+    let outward = |face: FaceKey, point: Vec3| -> Option<Vec3> {
+        let node = body.faces.get(face)?;
+        let surface = body.surfaces.get(node.surface)?;
+        let (u, v) = surface.parameters_at(point.to_array())?;
+        let normal = Vec3::from(surface.normal_at(u, v)?);
+        Some(if node.forward { normal } else { -normal })
+    };
+    let point_at =
+        |fraction: f64| Vec3::from(curve.point_at(edge.start_parameter + span * fraction));
+    let normals_at = |point: Vec3| Some([outward(faces[0], point)?, outward(faces[1], point)?]);
+    let start = point_at(0.0);
+    let normals = normals_at(start)?;
+    let dot = normals[0].dot(normals[1]);
+    if dot.abs() > 1.0 - 1e-9 {
+        return None;
+    }
+    let middle = point_at(0.5);
+    let crossed = normals_at(middle)?;
+    let probe = middle + (crossed[1] - crossed[0]) * (circle.radius * 0.01);
+    let convex = super::classify::contains_point(body, probe.to_array(), tolerance)
+        == super::Containment::Outside;
+    let side = if convex { -1.0 } else { 1.0 };
+    let radius = match section {
+        Section::Round(radius) => radius,
+        Section::Bevel { base, other, .. } => base.max(other),
+    };
+    let touch = |at: Vec3, normals: [Vec3; 2], index: usize| -> Option<Vec3> {
+        let dot = normals[0].dot(normals[1]);
+        Some(match section {
+            Section::Round(_) => {
+                at + (normals[0] + normals[1]) * (side * radius / (1.0 + dot))
+                    - normals[index] * (side * radius)
+            }
+            Section::Bevel { base_face, base, other } => {
+                let across = (normals[1 - index] - normals[index] * dot).normalize()?;
+                at + across * (side * if faces[index] == base_face { base } else { other })
+            }
+        })
+    };
+    // The ball rests on both faces all round, as along a line.
+    for fraction in [0.02, 0.25, 0.5, 0.75, 0.98] {
+        let at = point_at(fraction);
+        let normals = normals_at(at)?;
+        for index in 0..2 {
+            let point = touch(at, normals, index)?.to_array();
+            if super::classify::face_distance(body, faces[index], point, tolerance)? > tolerance {
+                return None;
+            }
+        }
+    }
+    // The section in the plane through the axis at the edge's start.
+    let radial = (start - centre - axis * (start - centre).dot(axis)).normalize()?;
+    let plane =
+        Plane::orthonormal(centre.to_array(), radial.to_array(), radial.cross(axis).to_array())?;
+    let flat = |point: Vec3| plane.project(point.to_array());
+    let clear = if convex { radius * 0.25 } else { 0.0 };
+    let lift = |point: Vec3, index: usize| point + normals[index] * clear;
+    let (first_at, second_at) = (touch(start, normals, 0)?, touch(start, normals, 1)?);
+    let (corner, first, second, ball) = (
+        flat(start + (normals[0] + normals[1]) * clear)?,
+        flat(first_at)?,
+        flat(second_at)?,
+        flat(start + (normals[0] + normals[1]) * (side * radius / (1.0 + dot)))?,
+    );
+    let (first_out, second_out) = (flat(lift(first_at, 0))?, flat(lift(second_at, 1))?);
+    let angle = |p: [f64; 2]| (p[1] - ball[1]).atan2(p[0] - ball[0]);
+    let (a, b, c) = (angle(first), angle(second), angle(corner));
+    let turn = |from: f64, to: f64| (to - from).rem_euclid(TAU);
+    let (from, to) = if turn(a, c) < turn(a, b) { (a, b) } else { (b, a) };
+    let line = |start, end| crate::geom2d::Curve::Line(crate::geom2d::Line { start, end });
+    let arc = match section {
+        Section::Round(_) => crate::geom2d::Curve::Arc(crate::geom2d::Arc {
+            centre: ball,
+            radius,
+            start_angle: from,
+            end_angle: from + turn(from, to),
+        }),
+        Section::Bevel { .. } => line(second, first),
+    };
+    let profile = if convex {
+        vec![
+            line(first, first_out),
+            line(first_out, corner),
+            line(corner, second_out),
+            line(second_out, second),
+            arc,
+        ]
+    } else {
+        vec![line(corner, first), arc, line(second, corner)]
+    };
+    let tool = super::revolve(plane, &profile, centre.to_array(), axis.to_array(), span)?;
+    let how = if convex {
+        super::boolean::Operation::Difference
+    } else {
+        super::boolean::Operation::Union
+    };
+    let rounded = super::combine(body.clone(), tool, how, tolerance).ok()?;
+    (rounded.validate().is_empty() && !rounded.roots.is_empty()).then_some(rounded)
 }
 
 fn cut_along_edge(
@@ -1986,6 +2151,84 @@ mod tests {
             .map(|coedge| body.coedges.get(coedge).unwrap().edge)
             .collect::<Vec<_>>();
         (face, [edges[0], edges[2]])
+    }
+
+    #[test]
+    fn a_boss_rim_rounds_and_its_root_fills_by_their_rings_volumes() {
+        // A cylinder standing on a plate: its top rim convex, its root
+        // concave. Swept round the axis, each section takes or adds by
+        // Pappus its area times the path of its centroid — the round's
+        // (10 - 3π)/(12 - 3π) of a radius off the corner, a bevel's a third
+        // of each setback: in from the top rim, out at the root.
+        let plate = crate::brep::make::cuboid([-5.0, -5.0, 0.0], [10.0, 10.0, 1.0]).unwrap();
+        let boss = crate::brep::make::cylinder([0.0, 0.0, 1.0], 2.0, 3.0).unwrap();
+        let part = crate::brep::combine(plate, boss, crate::brep::Operation::Union, 1e-9).unwrap();
+        let rim = |height: f64| {
+            part.edges
+                .iter()
+                .find(|(_, edge)| {
+                    matches!(part.curves.get(edge.curve), Some(Curve3::Circle(circle))
+                        if (circle.plane.origin[2] - height).abs() < 1e-9)
+                })
+                .map(|(key, _)| key)
+                .unwrap()
+        };
+        let volume = |body: &Body| crate::brep::mass_properties(body).unwrap().volume;
+        let tolerance = operation_tolerance(&[&part]);
+        let radius = 0.3;
+        let round = (radius * radius * (1.0 - PI / 4.0), (10.0 - 3.0 * PI) / (12.0 - 3.0 * PI));
+        for (height, sign) in [(4.0, -1.0), (1.0, 1.0)] {
+            let edge = rim(height);
+            let plane = part
+                .edges
+                .get(edge)
+                .unwrap()
+                .coedges
+                .iter()
+                .map(|coedge| {
+                    part.loops.get(part.coedges.get(*coedge).unwrap().owner).unwrap().owner
+                })
+                .find(|face| {
+                    matches!(part.surfaces.get(part.faces.get(*face).unwrap().surface),
+                        Some(Surface::Plane(_)))
+                })
+                .unwrap();
+            let bevel = Section::Bevel { base_face: plane, base: radius, other: radius };
+            for (section, (area, off)) in
+                [(Section::Round(radius), round), (bevel, (radius * radius / 2.0, 1.0 / 3.0))]
+            {
+                let cut = turn_along_edge(&part, edge, section, tolerance).unwrap();
+                let change = volume(&cut) - volume(&part);
+                let expected = sign * area * TAU * (2.0 + sign * off * radius);
+                assert!((change - expected).abs() < 1e-3 * expected.abs(), "{change} {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_countersinks_rim_rounds_off() {
+        // The countersink's cone opens into the plate's top: a convex rim
+        // the round takes a ring off.
+        let plate = crate::brep::make::cuboid([-5.0, -5.0, 0.0], [10.0, 10.0, 2.0]).unwrap();
+        let sink = crate::brep::make::frustum([0.0, 0.0, 0.5], 1.0, 1.0, 2.5, 1.5).unwrap();
+        let part =
+            crate::brep::combine(plate, sink, crate::brep::Operation::Difference, 1e-9).unwrap();
+        let rim = part
+            .edges
+            .iter()
+            .find(|(_, edge)| {
+                matches!(part.curves.get(edge.curve), Some(Curve3::Circle(circle))
+                    if (circle.plane.origin[2] - 2.0).abs() < 1e-9)
+            })
+            .map(|(key, _)| key)
+            .unwrap();
+        let tolerance = operation_tolerance(&[&part]);
+        let cut = turn_along_edge(&part, rim, Section::Round(0.2), tolerance).unwrap();
+        let volume = |body: &Body| crate::brep::mass_properties(body).unwrap().volume;
+        assert!(cut.validate().is_empty());
+        let change = volume(&part) - volume(&cut);
+        // Under the corner's square of the radius swept round the rim.
+        assert!(change > 0.0 && change < 0.2 * 0.2 * TAU * 2.5, "{change}");
     }
 
     #[test]
