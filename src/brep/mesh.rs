@@ -2710,13 +2710,16 @@ fn scheduled_band(
                     parameter_range(&points, *a).total_cmp(&parameter_range(&points, *b))
                 });
             // A seam, the face meeting itself along a meridian down to a
-            // pole, bounds nothing: the band closes across it.
-            let seam = body.edges.get(coedge.edge).is_some_and(|edge| {
-                edge.coedges.len() == 2
-                    && edge.coedges.iter().all(|other| {
-                        body.coedges.get(*other).is_some_and(|other| other.owner == *loop_key)
-                    })
-            });
+            // pole, bounds nothing: the band closes across it. A spline
+            // surface's seams keep to the general mesher, which reads one
+            // the same however the file wrote it.
+            let seam = !matches!(surface, super::geometry::Surface::Nurbs(_))
+                && body.edges.get(coedge.edge).is_some_and(|edge| {
+                    edge.coedges.len() == 2
+                        && edge.coedges.iter().all(|other| {
+                            body.coedges.get(*other).is_some_and(|other| other.owner == *loop_key)
+                        })
+                });
             if let Some(varying) = varying {
                 candidates.push((varying, points));
                 loop_has_candidate = true;
