@@ -182,12 +182,19 @@ pub(super) fn imprint_reaching(
             dropped.push(*index);
         }
     }
-    let (curves, found): (Vec<Curve3>, Vec<[Option<Aabb>; 2]>) = curves
+    let mut kept: Vec<(Curve3, [Option<Aabb>; 2])> = curves
         .into_iter()
         .zip(found)
         .enumerate()
         .filter_map(|(index, pair)| (!dropped.contains(&index)).then_some(pair))
-        .unzip();
+        .collect();
+    // Lines before circles. A circle cut first is an island, and a line
+    // tangent to it afterwards — a wall running into the round of a corner —
+    // lands on the island's rim and bridges it to the face's rim; cut after
+    // the lines, the circle touches the walls at two places and divides the
+    // corner off as it should.
+    kept.sort_by_key(|(curve, _)| matches!(curve, Curve3::Circle(_) | Curve3::Ellipse(_)));
+    let (curves, found): (Vec<Curve3>, Vec<[Option<Aabb>; 2]>) = kept.into_iter().unzip();
     // A curve cuts one body only where the other body's faces it was found
     // with are. A traced curve runs round its whole surface, and on a part
     // whose fillets share one torus it otherwise cut every fillet, wherever

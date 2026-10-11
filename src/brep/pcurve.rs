@@ -892,7 +892,10 @@ fn tube_band_side(
             if high[0] + shift_u < point[0] - pad || low[0] + shift_u > point[0] + u_period + pad {
                 continue;
             }
-            for v_turn in -1..=1 {
+            // The point may come a turn or two of `v` away itself — the
+            // callers try its periodic images — and a rim missing a copy
+            // there lets one farther along answer for it.
+            for v_turn in -3..=3 {
                 let shift = [shift_u, v_turn as f64 * v_period];
                 if high[1] + shift[1] < point[1] - pad || low[1] + shift[1] > point[1] + pad {
                     continue;
