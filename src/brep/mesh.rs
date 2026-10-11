@@ -53,7 +53,18 @@ impl Mesh {
     /// Volume, centroid and inertia of a closed, consistently wound mesh.
     /// A local reference keeps the integration stable at survey coordinates.
     pub fn inertial_properties(&self) -> Option<super::MassProperties> {
-        let reference = Vec3::from(*self.positions.first()?);
+        // Measured about the middle of the mesh: a mesh a hair short of
+        // closed — faces meshed apart along their shared edges — reads its
+        // gap once per unit of distance to the reference, and the first
+        // vertex, wherever the faces happened to start, is as far as the
+        // part is long.
+        let count = self.positions.len() as f64;
+        let reference = self
+            .positions
+            .iter()
+            .fold(Vec3::new(0.0, 0.0, 0.0), |sum, point| sum + Vec3::from(*point))
+            / count;
+        self.positions.first()?;
         let mut signed_volume = 0.0;
         let mut centroid_numerator = [0.0; 3];
         let mut squared_integrals = [0.0; 3];

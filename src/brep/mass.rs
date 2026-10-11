@@ -73,7 +73,19 @@ pub fn mass_properties(body: &Body) -> Option<MassProperties> {
     let fine = meshed(0.05).or_else(|| meshed(0.2))?;
     // A face too fine to triangulate whole at the finer step still has its
     // properties at the coarser one.
-    Some(meshed(0.1).and_then(|coarse| extrapolated(&fine, &coarse)).unwrap_or(fine))
+    let Some(coarse) = meshed(0.1) else {
+        return Some(fine);
+    };
+    // Two steps a halving apart differ by a few parts in ten thousand. More
+    // than that, one of them is off — a spline tube meshed over itself at
+    // the coarser step — and the pair a step finer settles it.
+    let apart = (fine.volume - coarse.volume).abs() > 2e-3 * fine.volume.abs();
+    if apart {
+        if let Some(finest) = meshed(0.025) {
+            return Some(extrapolated(&finest, &fine).unwrap_or(finest));
+        }
+    }
+    Some(extrapolated(&fine, &coarse).unwrap_or(fine))
 }
 
 /// Properties from a mesh and one twice as coarse, each integral carried on
