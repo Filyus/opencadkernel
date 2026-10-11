@@ -594,18 +594,35 @@ fn collapse_lenses(body: &mut Body, tolerance: f64) {
 }
 
 /// The corners on a spline edge: the only ones a fit can have put off.
-fn on_splines(body: &Body) -> std::collections::HashSet<VertexKey> {
-    body.edges
-        .iter()
-        .filter(|(_, edge)| {
-            // A straight spline — a line kept to where two faces meet — is
-            // exact, and a fit's reach would join two corners a line apart.
-            body.curves
-                .get(edge.curve)
-                .is_some_and(|curve| matches!(curve, Curve3::Nurbs(spline) if spline.degree() > 1))
-        })
-        .flat_map(|(_, edge)| [edge.start, edge.end])
-        .collect()
+fn on_splines(body: &Body) -> HashMap<VertexKey, bool> {
+    // A straight spline — a line kept to where two faces meet — is exact
+    // but for where it was cut off; a curved one is a fit throughout.
+    let mut out: HashMap<VertexKey, bool> = HashMap::new();
+    for (_, edge) in body.edges.iter() {
+        let Some(Curve3::Nurbs(spline)) = body.curves.get(edge.curve) else {
+            continue;
+        };
+        for key in [edge.start, edge.end] {
+            *out.entry(key).or_insert(false) |= spline.degree() > 1;
+        }
+    }
+    out
+}
+
+/// How far a corner on a spline may be from the one it is: a fit's reach,
+/// or a hundredth of it on a straight spline alone — two nearly parallel
+/// lines on a large part meet a few hundredths apart and are two corners.
+fn spline_reach(
+    splined: &HashMap<VertexKey, bool>,
+    key: VertexKey,
+    tolerance: f64,
+    reach: f64,
+) -> f64 {
+    match splined.get(&key) {
+        Some(true) => reach,
+        Some(false) => (reach * 1e-2).max(tolerance),
+        None => tolerance,
+    }
 }
 
 /// Moves each corner the imprint made in `target` onto the nearest corner of
@@ -619,7 +636,7 @@ fn snap_cut_vertices(target: &mut Body, source: &Body, tolerance: f64, reach: f6
     let keys: Vec<VertexKey> = target.vertices.keys().collect();
     let splined = on_splines(target);
     for key in keys {
-        if !splined.contains(&key) {
+        if !splined.contains_key(&key) {
             continue;
         }
         let Some(vertex) = target.vertices.get_mut(key) else {
@@ -634,7 +651,7 @@ fn snap_cut_vertices(target: &mut Body, source: &Body, tolerance: f64, reach: f6
             .map(|corner| (corner.distance(here), *corner))
             .min_by(|x, y| x.0.total_cmp(&y.0));
         if let Some((gap, corner)) = nearest {
-            if gap > tolerance && gap <= reach {
+            if gap > tolerance && gap <= spline_reach(&splined, key, tolerance, reach) {
                 vertex.point = corner.to_array();
             }
         }
@@ -657,7 +674,7 @@ fn fuse_cut_vertices(body: &mut Body, tolerance: f64, reach: f64) {
     // How far a made corner may be from the one it is: a spline's fit, or
     // for exact curves the modelling tolerance two cuts landing on one
     // crossing still miss each other by.
-    let reach_of = |key: VertexKey| if splined.contains(&key) { reach } else { tolerance };
+    let reach_of = |key: VertexKey| spline_reach(&splined, key, tolerance, reach);
     let mut into: std::collections::HashMap<VertexKey, VertexKey> = Default::default();
     for key in &keys {
         if !made(body, *key) || into.contains_key(key) {
