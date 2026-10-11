@@ -2709,10 +2709,18 @@ fn scheduled_band(
                 .max_by(|a, b| {
                     parameter_range(&points, *a).total_cmp(&parameter_range(&points, *b))
                 });
+            // A seam, the face meeting itself along a meridian down to a
+            // pole, bounds nothing: the band closes across it.
+            let seam = body.edges.get(coedge.edge).is_some_and(|edge| {
+                edge.coedges.len() == 2
+                    && edge.coedges.iter().all(|other| {
+                        body.coedges.get(*other).is_some_and(|other| other.owner == *loop_key)
+                    })
+            });
             if let Some(varying) = varying {
                 candidates.push((varying, points));
                 loop_has_candidate = true;
-            } else {
+            } else if !seam {
                 loop_has_refined_side |= samples.len() > 2;
             }
         }
@@ -2772,8 +2780,10 @@ fn scheduled_band(
         let ring = scheduled_loop(body, *loop_key, surface, schedules, tolerance)?;
         if ring.len() >= 3 {
             let traversal = ring.last()?.parameters[varying] - ring.first()?.parameters[varying];
-            if rims.len() == 1 && winding_rim.is_none() && traversal.abs() >= period * (1.0 - 1e-9)
-            {
+            // A loop round the surface travels a whole turn, a hole none: a
+            // traced loop's pieces, a fit apart where they meet, fall a hair
+            // short of the turn.
+            if rims.len() == 1 && winding_rim.is_none() && traversal.abs() >= period * 0.5 {
                 winding_rim = Some(ring);
             } else {
                 holes.push(ring);
