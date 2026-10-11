@@ -23,24 +23,35 @@ pub(super) struct FaceSoups {
 
 impl FaceSoups {
     pub(super) fn of(body: &Body, tolerance: f64) -> Self {
-        let mesh = tessellate(body, TessellationTolerance::new(0.1, tolerance.max(1e-9)));
+        let chord = tolerance.max(1e-9);
+        let mesh = tessellate(body, TessellationTolerance::new(0.1, chord));
         let mut by_face: HashMap<FaceKey, Vec<[Vec3; 3]>> = HashMap::new();
-        let mut deviation: HashMap<FaceKey, f64> = HashMap::new();
         for (triangle, face) in mesh.mesh.triangles.iter().zip(&mesh.triangle_faces) {
             let corners = triangle.map(|index| Vec3::from(mesh.mesh.positions[index]));
-            if let Some(surface) = body
-                .faces
-                .get(*face)
-                .and_then(|node| body.surfaces.get(node.surface))
-            {
-                let centre = (corners[0] + corners[1] + corners[2]) * (1.0 / 3.0);
-                let gap = surface.distance_to(centre.to_array()).abs();
-                if gap.is_finite() {
-                    let worst = deviation.entry(*face).or_default();
-                    *worst = worst.max(gap);
-                }
-            }
             by_face.entry(*face).or_default().push(corners);
+        }
+        // How far each face's mesh strays, read at a few hundred of its
+        // triangles — half as much again where some went unread — and never
+        // below the chord it was meshed to: projecting every centroid onto a
+        // spline was most of a boolean's time.
+        let mut deviation: HashMap<FaceKey, f64> = HashMap::new();
+        for (face, triangles) in &by_face {
+            let Some(surface) =
+                body.faces.get(*face).and_then(|node| body.surfaces.get(node.surface))
+            else {
+                continue;
+            };
+            let stride = (triangles.len() / 256).max(1);
+            let worst = triangles
+                .iter()
+                .step_by(stride)
+                .map(|corners| {
+                    let centre = (corners[0] + corners[1] + corners[2]) * (1.0 / 3.0);
+                    surface.distance_to(centre.to_array()).abs()
+                })
+                .filter(|gap| gap.is_finite())
+                .fold(chord, f64::max);
+            deviation.insert(*face, if stride > 1 { worst * 1.5 } else { worst });
         }
         // A face the mesh could not draw has no soup: nothing can be proved
         // about it, and `apart` says so.

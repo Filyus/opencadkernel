@@ -827,6 +827,26 @@ pub struct NurbsSurface3 {
     u_closed: bool,
     v_closed: bool,
     v_reversed: bool,
+    samples: Samples,
+}
+
+/// The coarse grid the nearest-point search starts from, evaluated once a
+/// surface: it depends on the surface alone, and a cut walking a spline
+/// across a patch asked it tens of thousands of times. Not part of what the
+/// surface is — two surfaces equal but for it are equal.
+#[derive(Clone, Default)]
+struct Samples(std::sync::OnceLock<Vec<(f64, f64, [f64; 3])>>);
+
+impl PartialEq for Samples {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for Samples {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("..")
+    }
 }
 
 impl NurbsSurface3 {
@@ -893,6 +913,7 @@ impl NurbsSurface3 {
             u_closed,
             v_closed,
             v_reversed: false,
+            samples: Samples::default(),
         })
     }
 
@@ -1008,6 +1029,7 @@ impl NurbsSurface3 {
             u_closed,
             v_closed,
             v_reversed: false,
+            samples: Samples::default(),
         })
     }
 
@@ -1019,6 +1041,7 @@ impl NurbsSurface3 {
 
     pub fn with_v_reversed(mut self, reversed: bool) -> Self {
         self.v_reversed = reversed;
+        self.samples = Samples::default();
         self
     }
 
@@ -1060,16 +1083,22 @@ impl NurbsSurface3 {
             return None;
         }
         let target = Vec3::from(point);
-        let mut best = (f64::INFINITY, u0, v0);
-        for u_index in 0..=GRID {
-            let u = u0 + (u1 - u0) * u_index as f64 / GRID as f64;
-            for v_index in 0..=GRID {
-                let v = v0 + (v1 - v0) * v_index as f64 / GRID as f64;
-                let distance =
-                    (Vec3::from(self.point_at_knot(u, v)) - target).length_squared();
-                if distance.is_finite() && distance < best.0 {
-                    best = (distance, u, v);
+        let samples = self.samples.0.get_or_init(|| {
+            let mut samples = Vec::with_capacity((GRID + 1) * (GRID + 1));
+            for u_index in 0..=GRID {
+                let u = u0 + (u1 - u0) * u_index as f64 / GRID as f64;
+                for v_index in 0..=GRID {
+                    let v = v0 + (v1 - v0) * v_index as f64 / GRID as f64;
+                    samples.push((u, v, self.point_at_knot(u, v)));
                 }
+            }
+            samples
+        });
+        let mut best = (f64::INFINITY, u0, v0);
+        for (u, v, at) in samples {
+            let distance = (Vec3::from(*at) - target).length_squared();
+            if distance.is_finite() && distance < best.0 {
+                best = (distance, *u, *v);
             }
         }
         if !best.0.is_finite() {

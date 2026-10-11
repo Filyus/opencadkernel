@@ -475,6 +475,37 @@ impl Surface {
 /// `(u, v, t)`. `None` when a crossing will not settle — a ray grazing the
 /// patch, whose count of crossings is not to be trusted either way.
 fn nurbs_ray_hits(surface: &NurbsSurface3, origin: Vec3, direction: Vec3) -> Option<Vec<f64>> {
+    // The patch lies within its control net's box (positive weights); a
+    // line passing the box meets none of it, and the grid below costs
+    // thousands of evaluations a ray.
+    if surface.weights().iter().flatten().all(|weight| *weight > 0.0) {
+        let mut low = [f64::INFINITY; 3];
+        let mut high = [f64::NEG_INFINITY; 3];
+        for point in surface.control_points().iter().flatten() {
+            for axis in 0..3 {
+                low[axis] = low[axis].min(point[axis]);
+                high[axis] = high[axis].max(point[axis]);
+            }
+        }
+        let (start, along) = (origin.to_array(), direction.to_array());
+        let reach = (0..3).map(|axis| high[axis] - low[axis]).fold(0.0, f64::max) * 1e-9;
+        let (mut enter, mut leave) = (f64::NEG_INFINITY, f64::INFINITY);
+        for axis in 0..3 {
+            let (from, to) = (low[axis] - reach, high[axis] + reach);
+            if along[axis].abs() <= f64::EPSILON {
+                if start[axis] < from || start[axis] > to {
+                    return Some(Vec::new());
+                }
+                continue;
+            }
+            let (a, b) = ((from - start[axis]) / along[axis], (to - start[axis]) / along[axis]);
+            enter = enter.max(a.min(b));
+            leave = leave.min(a.max(b));
+        }
+        if enter > leave {
+            return Some(Vec::new());
+        }
+    }
     let ((u0, u1), (v0, v1)) = surface.domain();
     let (u_knots, v_knots) = surface.knots();
     // ponytail: four cells a knot span; a patch folding tighter than that can
