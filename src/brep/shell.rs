@@ -90,7 +90,7 @@ pub fn shell(
     } else if let Some(shape) = recognize_sphere(body) {
         shell_sphere(body, &shape, &removed, distance)?
     } else {
-        return Err(ShellError::UnsupportedSolid);
+        shell_polyhedral(body, &removed, distance)?
     };
     if result.face_keys().next().is_none() || result.roots.is_empty() {
         return Err(ShellError::NoMaterial);
@@ -319,6 +319,223 @@ fn shell_sphere(
     subtract(outer, cavity, body)
 }
 
+/// Any solid bounded by planes alone: the cavity is the solid with every
+/// face moved in by the thickness — each corner where its faces' moved
+/// planes meet — and every removed face moved out instead, so the cavity
+/// runs out through it. Grown outward, the exterior is the solid moved out
+/// and the cavity the solid itself, run out through the removed faces.
+/// Refused where a moved face would turn over, cross itself or lose a
+/// corner — the thickness eating a narrower part of the solid.
+fn shell_polyhedral(
+    body: &Body,
+    removed: &HashSet<FaceKey>,
+    distance: f64,
+) -> Result<Body, ShellError> {
+    let planar = body.faces.iter().all(|(_, face)| {
+        matches!(body.surfaces.get(face.surface), Some(Surface::Plane(_)))
+    });
+    if !planar {
+        return Err(ShellError::UnsupportedSolid);
+    }
+    if removed.len() == body.faces.len() {
+        return Err(ShellError::NoMaterial);
+    }
+    let thickness = distance.abs();
+    let through = |face: FaceKey| if removed.contains(&face) { thickness * 2.0 } else { 0.0 };
+    let (outer, cavity) = if distance > 0.0 {
+        let cavity = offset_planes(body, &|face| {
+            if removed.contains(&face) { through(face) } else { -thickness }
+        })
+        .ok_or(ShellError::NoMaterial)?;
+        // Every corner of the cavity not run out through an open face lies
+        // inside the solid; one outside is a wall thinner than the shell.
+        let tolerance = super::operation_tolerance(&[body]);
+        let faces_at = corner_faces(&cavity);
+        let inside = cavity.vertices.iter().all(|(key, vertex)| {
+            let open = faces_at
+                .get(&key)
+                .is_some_and(|faces| faces.iter().any(|face| removed.contains(face)));
+            open || super::contains_point(body, vertex.point, tolerance)
+                == super::Containment::Inside
+        });
+        if !inside {
+            return Err(ShellError::NoMaterial);
+        }
+        (body.clone(), cavity)
+    } else {
+        let outer = offset_planes(body, &|_| thickness).ok_or(ShellError::NoMaterial)?;
+        let cavity = offset_planes(body, &through).ok_or(ShellError::NoMaterial)?;
+        (outer, cavity)
+    };
+    let hollow = subtract(outer.clone(), cavity.clone(), body)?;
+    // A closed cavity takes exactly its own volume out of the exterior.
+    if removed.is_empty() {
+        let volume = |body: &Body| super::mass_properties(body).map(|mass| mass.volume);
+        let (whole, inner, left) = (
+            volume(&outer).ok_or(ShellError::NoMaterial)?,
+            volume(&cavity).ok_or(ShellError::NoMaterial)?,
+            volume(&hollow).ok_or(ShellError::NoMaterial)?,
+        );
+        if (whole - inner - left).abs() > 1e-6 * whole.abs() {
+            return Err(ShellError::NoMaterial);
+        }
+    }
+    Ok(hollow)
+}
+
+/// `body`, every face moved along its outward normal by `shift` of it and
+/// every corner put where its faces' moved planes meet, keeping the
+/// topology. `None` where three planes do not settle a corner, or a face
+/// turns over or crosses itself on the way.
+fn offset_planes(body: &Body, shift: &dyn Fn(FaceKey) -> f64) -> Option<Body> {
+    let tolerance = super::operation_tolerance(&[body]);
+    let mut result = body.clone();
+    let mut planes: HashMap<FaceKey, (Vec3, f64)> = HashMap::new();
+    for (key, face) in body.faces.iter() {
+        let Some(Surface::Plane(plane)) = body.surfaces.get(face.surface) else {
+            return None;
+        };
+        let normal = Vec3::from(plane.normal()?) * if face.forward { 1.0 } else { -1.0 };
+        let moved = Vec3::from(plane.origin) + normal * shift(key);
+        planes.insert(key, (normal, normal.dot(moved)));
+        let mut surface = *plane;
+        surface.origin = moved.to_array();
+        let slot = result.surfaces.insert(Surface::Plane(surface));
+        result.faces.get_mut(key)?.surface = slot;
+    }
+    // Each corner: the point nearest every moved plane round it, which must
+    // lie on all of them.
+    let faces_at = corner_faces(body);
+    for (key, _) in body.vertices.iter() {
+        let around: Vec<(Vec3, f64)> = faces_at
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter_map(|face| planes.get(face).copied())
+            .collect();
+        if around.len() < 3 {
+            return None;
+        }
+        let mut normal = [[0.0; 3]; 3];
+        let mut right = [0.0; 3];
+        for (n, c) in &around {
+            let n = n.to_array();
+            for row in 0..3 {
+                for column in 0..3 {
+                    normal[row][column] += n[row] * n[column];
+                }
+                right[row] += n[row] * c;
+            }
+        }
+        let point = Vec3::from(solve3(normal, right)?);
+        let scale = 1.0 + point.length();
+        if around.iter().any(|(n, c)| (n.dot(point) - c).abs() > tolerance.max(1e-12 * scale)) {
+            return None;
+        }
+        result.vertices.get_mut(key)?.point = point.to_array();
+    }
+    // Straight edges between the new corners.
+    for (key, edge) in body.edges.iter() {
+        let from = Vec3::from(result.vertices.get(edge.start)?.point);
+        let to = Vec3::from(result.vertices.get(edge.end)?.point);
+        let along = to - from;
+        if along.length() <= tolerance {
+            return None;
+        }
+        let curve = result.curves.insert(super::Curve3::Line(super::geometry::Line3 {
+            origin: from.to_array(),
+            direction: along.to_array(),
+        }));
+        let node = result.edges.get_mut(key)?;
+        node.curve = curve;
+        node.start_parameter = 0.0;
+        node.end_parameter = 1.0;
+        for coedge in node.coedges.clone() {
+            result.coedges.get_mut(coedge)?.pcurve = None;
+        }
+    }
+    // Each face the same way round as before, and simple.
+    for (key, _) in body.faces.iter() {
+        let (before, _) = super::split::planar_measure(body, key)?;
+        let (after, _) = super::split::planar_measure(&result, key)?;
+        if before * after <= 0.0 || after.abs() <= tolerance * tolerance {
+            return None;
+        }
+        if folds(&result, key, tolerance)? {
+            return None;
+        }
+    }
+    result.validate().is_empty().then_some(result)
+}
+
+/// The faces meeting at each corner.
+fn corner_faces(body: &Body) -> HashMap<super::VertexKey, HashSet<FaceKey>> {
+    let mut faces: HashMap<super::VertexKey, HashSet<FaceKey>> = HashMap::new();
+    for face in body.face_keys() {
+        for coedge in body.face_coedges(face) {
+            if let Some((from, to)) = body.coedge_vertices(coedge) {
+                faces.entry(from).or_default().insert(face);
+                faces.entry(to).or_default().insert(face);
+            }
+        }
+    }
+    faces
+}
+
+/// Whether two straight edges of a face cross anywhere but at a corner they
+/// share.
+fn folds(body: &Body, face: FaceKey, tolerance: f64) -> Option<bool> {
+    let node = body.faces.get(face)?;
+    let Some(Surface::Plane(plane)) = body.surfaces.get(node.surface) else {
+        return None;
+    };
+    let mut segments: Vec<([f64; 2], [f64; 2])> = Vec::new();
+    for coedge in body.face_coedges(face) {
+        let edge = body.edges.get(body.coedges.get(coedge)?.edge)?;
+        let from = plane.project(body.vertices.get(edge.start)?.point)?;
+        let to = plane.project(body.vertices.get(edge.end)?.point)?;
+        segments.push((from, to));
+    }
+    let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= tolerance;
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| {
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    };
+    for (index, (a, b)) in segments.iter().enumerate() {
+        for (c, d) in &segments[index + 1..] {
+            if near(*a, *c) || near(*a, *d) || near(*b, *c) || near(*b, *d) {
+                continue;
+            }
+            let (d1, d2) = (cross(*a, *b, *c), cross(*a, *b, *d));
+            let (d3, d4) = (cross(*c, *d, *a), cross(*c, *d, *b));
+            if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// The solution of a 3×3 system by Cramer's rule, `None` when singular.
+fn solve3(m: [[f64; 3]; 3], r: [f64; 3]) -> Option<[f64; 3]> {
+    let det = |m: [[f64; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let whole = det(m);
+    let scale = m.iter().flatten().fold(0.0f64, |big, value| big.max(value.abs()));
+    if whole.abs() <= 1e-12 * scale.powi(3) {
+        return None;
+    }
+    Some(std::array::from_fn(|column| {
+        let mut swapped = m;
+        for row in 0..3 {
+            swapped[row][column] = r[row];
+        }
+        det(swapped) / whole
+    }))
+}
+
 fn subtract(outer: Body, cavity: Body, reference: &Body) -> Result<Body, ShellError> {
     let tolerance = super::operation_tolerance(&[reference, &outer, &cavity]);
     super::combine(outer, cavity, Operation::Difference, tolerance).map_err(ShellError::Kernel)
@@ -468,6 +685,33 @@ mod tests {
     use super::*;
     use crate::brep::{analytic_mass_properties, make};
     use std::f64::consts::PI;
+
+    #[test]
+    fn an_l_shaped_block_hollows_closed_open_and_outward() {
+        // The L's footprint is 12, its cavity's moved in a tenth 10.44 and
+        // its grown exterior's 13.64.
+        let long = make::cuboid([0.0; 3], [4.0, 2.0, 1.0]).unwrap();
+        let wing = make::cuboid([0.0; 3], [2.0, 4.0, 1.0]).unwrap();
+        let block = crate::brep::combine(long, wing, Operation::Union, 1e-9).unwrap();
+        let volume = |body: &Body| crate::brep::mass_properties(body).unwrap().volume;
+        let top = block
+            .face_keys()
+            .find(|face| {
+                let node = block.faces.get(*face).unwrap();
+                matches!(block.surfaces.get(node.surface), Some(Surface::Plane(plane))
+                    if (plane.origin[2] - 1.0).abs() < 1e-9)
+            })
+            .unwrap();
+        for (removed, distance, expected) in [
+            (vec![], 0.1, 12.0 - 10.44 * 0.8),
+            (vec![top], 0.1, 12.0 - 10.44 * 0.9),
+            (vec![], -0.1, 13.64 * 1.2 - 12.0),
+        ] {
+            let hollow = shell(&block, &removed, distance).unwrap();
+            assert!(hollow.validate().is_empty());
+            assert!((volume(&hollow) - expected).abs() < 1e-6 * expected, "{distance}");
+        }
+    }
 
     #[test]
     fn a_sphere_shell_has_the_exact_annular_volume() {
