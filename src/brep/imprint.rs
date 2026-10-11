@@ -598,7 +598,11 @@ fn on_splines(body: &Body) -> std::collections::HashSet<VertexKey> {
     body.edges
         .iter()
         .filter(|(_, edge)| {
-            body.curves.get(edge.curve).is_some_and(|curve| matches!(curve, Curve3::Nurbs(_)))
+            // A straight spline — a line kept to where two faces meet — is
+            // exact, and a fit's reach would join two corners a line apart.
+            body.curves
+                .get(edge.curve)
+                .is_some_and(|curve| matches!(curve, Curve3::Nurbs(spline) if spline.degree() > 1))
         })
         .flat_map(|(_, edge)| [edge.start, edge.end])
         .collect()
