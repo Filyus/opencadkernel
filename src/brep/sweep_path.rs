@@ -3371,6 +3371,6 @@ pub fn revolve_off_plane(plane: Plane, profile: &[Curve], pivot: [f64; 3], axis:
         let start = patches.first()?[0];
         patches.last_mut()?[3] = start;
     }
-    let outward = if sheet { true } else { regular_transport(&wires, &patches)? };
+    let outward = if sheet { true } else { regular_transport(&wires, &patches, false)? };
     build_body_in_runs(&wires, &patches, &[patches.len()], sheet, closed, outward, false, None)
 }
