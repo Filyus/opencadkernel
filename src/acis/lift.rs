@@ -722,12 +722,15 @@ fn analytic_surface_reversed(record: &SatRecord) -> bool {
 }
 
 /// A cone record with a negative cosine has its normal towards the axis (the
-/// inner wall of a swept bend, for example), and a sphere with a negative
-/// radius towards its centre. The kernel's cones, cylinders and spheres
-/// always face outward, so the face turns instead.
+/// inner wall of a swept bend, for example), a sphere with a negative radius
+/// towards its centre, and a torus with a negative minor radius towards the
+/// middle of its tube (a concave round). The kernel's cones, cylinders,
+/// spheres and tori always face outward — a torus's sign only shifts where
+/// its tube angle starts — so the face turns instead.
 fn points_inward(record: &SatRecord) -> bool {
     SatConeSurface::from_record(record).is_some_and(|cone| cone.cos_half_angle() < 0.0)
         || SatSphereSurface::from_record(record).is_some_and(|sphere| sphere.radius() < 0.0)
+        || SatTorusSurface::from_record(record).is_some_and(|torus| torus.minor_radius() < 0.0)
 }
 
 fn surface_of(

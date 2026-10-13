@@ -53,7 +53,18 @@ impl Mesh {
     /// Volume, centroid and inertia of a closed, consistently wound mesh.
     /// A local reference keeps the integration stable at survey coordinates.
     pub fn inertial_properties(&self) -> Option<super::MassProperties> {
-        let reference = Vec3::from(*self.positions.first()?);
+        // Measured about the middle of the mesh: a mesh a hair short of
+        // closed — faces meshed apart along their shared edges — reads its
+        // gap once per unit of distance to the reference, and the first
+        // vertex, wherever the faces happened to start, is as far as the
+        // part is long.
+        let count = self.positions.len() as f64;
+        let reference = self
+            .positions
+            .iter()
+            .fold(Vec3::new(0.0, 0.0, 0.0), |sum, point| sum + Vec3::from(*point))
+            / count;
+        self.positions.first()?;
         let mut signed_volume = 0.0;
         let mut centroid_numerator = [0.0; 3];
         let mut squared_integrals = [0.0; 3];
@@ -202,7 +213,7 @@ impl Mesh {
     }
 }
 
-fn principal_axes(mut matrix: [[f64; 3]; 3]) -> ([f64; 3], [f64; 9]) {
+pub(super) fn principal_axes(mut matrix: [[f64; 3]; 3]) -> ([f64; 3], [f64; 9]) {
     let mut vectors = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     for _ in 0..24 {
         let (p, q) = [(0usize, 1usize), (0, 2), (1, 2)]
@@ -920,6 +931,7 @@ fn hairline_face(body: &Body, face: FaceKey) -> bool {
 
 /// Tessellates faces and edges from one shared sample schedule.
 pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
+    let _normals = SplineNormals::open();
     let schedules = body_edge_schedules(body, tolerance);
     let mut out = BodyMesh::default();
     for face_key in body.face_keys() {
@@ -2708,10 +2720,21 @@ fn scheduled_band(
                 .max_by(|a, b| {
                     parameter_range(&points, *a).total_cmp(&parameter_range(&points, *b))
                 });
+            // A seam, the face meeting itself along a meridian down to a
+            // pole, bounds nothing: the band closes across it. A spline
+            // surface's seams keep to the general mesher, which reads one
+            // the same however the file wrote it.
+            let seam = !matches!(surface, super::geometry::Surface::Nurbs(_))
+                && body.edges.get(coedge.edge).is_some_and(|edge| {
+                    edge.coedges.len() == 2
+                        && edge.coedges.iter().all(|other| {
+                            body.coedges.get(*other).is_some_and(|other| other.owner == *loop_key)
+                        })
+                });
             if let Some(varying) = varying {
                 candidates.push((varying, points));
                 loop_has_candidate = true;
-            } else {
+            } else if !seam {
                 loop_has_refined_side |= samples.len() > 2;
             }
         }
@@ -2771,8 +2794,10 @@ fn scheduled_band(
         let ring = scheduled_loop(body, *loop_key, surface, schedules, tolerance)?;
         if ring.len() >= 3 {
             let traversal = ring.last()?.parameters[varying] - ring.first()?.parameters[varying];
-            if rims.len() == 1 && winding_rim.is_none() && traversal.abs() >= period * (1.0 - 1e-9)
-            {
+            // A loop round the surface travels a whole turn, a hole none: a
+            // traced loop's pieces, a fit apart where they meet, fall a hair
+            // short of the turn.
+            if rims.len() == 1 && winding_rim.is_none() && traversal.abs() >= period * 0.5 {
                 winding_rim = Some(ring);
             } else {
                 holes.push(ring);
@@ -4954,10 +4979,95 @@ fn surface_triangle_angle_cached(
     surface_normal_angle_cached(surface, &parameters, cache)
 }
 
+type NormalsBySurface = HashMap<(usize, u64, u64), Option<[f64; 3]>>;
+type FramesBySurface = HashMap<(usize, u64, u64), Option<([f64; 3], [f64; 3])>>;
+
+std::thread_local! {
+    /// Spline normals already found while one body is meshed, by surface
+    /// and parameters: the quality tests ask again for the corners and edge
+    /// points neighbouring triangles share, a million normals for a column.
+    /// Open only for the length of a [`tessellate`] — a surface's address
+    /// names it there and nowhere else.
+    static SPLINE_NORMALS: std::cell::RefCell<Option<NormalsBySurface>> =
+        const { std::cell::RefCell::new(None) };
+    /// The tangents beside them, for the same reason.
+    static SPLINE_FRAMES: std::cell::RefCell<Option<FramesBySurface>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Keeps spline normals for as long as it lives, unless an outer one does.
+struct SplineNormals(bool);
+
+impl SplineNormals {
+    fn open() -> Self {
+        SPLINE_NORMALS.with(|normals| {
+            let mut normals = normals.borrow_mut();
+            let opened = normals.is_none();
+            if opened {
+                *normals = Some(HashMap::new());
+                SPLINE_FRAMES.with(|frames| *frames.borrow_mut() = Some(HashMap::new()));
+            }
+            Self(opened)
+        })
+    }
+}
+
+impl Drop for SplineNormals {
+    fn drop(&mut self) {
+        if self.0 {
+            SPLINE_NORMALS.with(|normals| *normals.borrow_mut() = None);
+            SPLINE_FRAMES.with(|frames| *frames.borrow_mut() = None);
+        }
+    }
+}
+
 /// A collapsed spline boundary has no differential normal at the pole.
 /// Retain its parameter-dependent one-sided limit for display, without
 /// accepting singularities in the interior of a surface.
 fn surface_display_normal(surface: &super::geometry::Surface, uv: [f64; 2]) -> Option<[f64; 3]> {
+    if !matches!(surface, super::geometry::Surface::Nurbs(_)) {
+        return display_normal(surface, uv);
+    }
+    let key = (surface as *const _ as usize, uv[0].to_bits(), uv[1].to_bits());
+    let known = SPLINE_NORMALS
+        .with(|normals| normals.borrow().as_ref().and_then(|normals| normals.get(&key).copied()));
+    if let Some(normal) = known {
+        return normal;
+    }
+    let normal = display_normal(surface, uv);
+    SPLINE_NORMALS.with(|normals| {
+        if let Some(normals) = normals.borrow_mut().as_mut() {
+            normals.insert(key, normal);
+        }
+    });
+    normal
+}
+
+/// [`Surface::tangents_at`](super::geometry::Surface::tangents_at), kept
+/// for a spline as its normals are.
+fn surface_frame(
+    surface: &super::geometry::Surface,
+    uv: [f64; 2],
+) -> Option<([f64; 3], [f64; 3])> {
+    if !matches!(surface, super::geometry::Surface::Nurbs(_)) {
+        return surface.tangents_at(uv[0], uv[1]);
+    }
+    let key = (surface as *const _ as usize, uv[0].to_bits(), uv[1].to_bits());
+    let known = SPLINE_FRAMES
+        .with(|frames| frames.borrow().as_ref().and_then(|frames| frames.get(&key).copied()));
+    if let Some(frame) = known {
+        return frame;
+    }
+    let frame = surface.tangents_at(uv[0], uv[1]);
+    SPLINE_FRAMES.with(|frames| {
+        if let Some(frames) = frames.borrow_mut().as_mut() {
+            frames.insert(key, frame);
+        }
+    });
+    frame
+}
+
+fn display_normal(surface: &super::geometry::Surface, uv: [f64; 2]) -> Option<[f64; 3]> {
     let direct = surface.normal_at(uv[0], uv[1]);
     let super::geometry::Surface::Nurbs(nurbs) = surface else {
         return direct;
@@ -5059,7 +5169,7 @@ fn surface_path_angle(surface: &super::geometry::Surface, parameters: &[[f64; 2]
     let length = delta[0].hypot(delta[1]);
     let frames = parameters
         .iter()
-        .map(|uv| surface.tangents_at(uv[0], uv[1]))
+        .map(|uv| surface_frame(surface, *uv))
         .collect::<Option<Vec<_>>>()?;
     let normals = parameters
         .iter()
