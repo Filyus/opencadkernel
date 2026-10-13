@@ -194,7 +194,9 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
                 pointer(ids.shell(face.owner)),
                 null(),
                 pointer(ids.surface(face.surface)),
-                sense(face.forward),
+                // A torus written with a negative minor radius faces into
+                // its tube once read, so the face turns back for it.
+                sense(face.forward != inward_torus(body.surfaces.get(face.surface))),
                 SatToken::Ident("single".to_string()),
             ],
         );
@@ -728,6 +730,10 @@ fn pointer(id: i32) -> SatToken {
 
 pub(super) fn null() -> SatToken {
     pointer(NULL)
+}
+
+fn inward_torus(surface: Option<&Surface>) -> bool {
+    matches!(surface, Some(Surface::Torus(torus)) if torus.minor_radius < 0.0)
 }
 
 fn sense(forward: bool) -> SatToken {

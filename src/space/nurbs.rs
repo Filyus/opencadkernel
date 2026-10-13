@@ -608,21 +608,37 @@ impl NurbsCurve3 {
         } else {
             (best.saturating_sub(1) as f64, (best + 1).min(steps) as f64)
         };
-        let mut low = from + (to - from) * below / steps as f64;
-        let mut high = from + (to - from) * above / steps as f64;
         // Down to rounding: a corner placed on the curve is found on it again
         // within a modelling tolerance, not a sampling one.
-        for _ in 0..64 {
-            let third = (high - low) / 3.0;
-            let one = low + third;
-            let two = high - third;
-            if distance(one) <= distance(two) {
-                high = two;
+        let narrow = |below: f64, above: f64| {
+            let mut low = from + (to - from) * below / steps as f64;
+            let mut high = from + (to - from) * above / steps as f64;
+            for _ in 0..64 {
+                let third = (high - low) / 3.0;
+                let one = low + third;
+                let two = high - third;
+                if distance(one) <= distance(two) {
+                    high = two;
+                } else {
+                    low = one;
+                }
+            }
+            wrap_parameter(0.5 * (low + high), from, to, self.closed)
+        };
+        let found = narrow(below, above);
+        // Clamped but closed, its two ends are one sample and the start won
+        // only the tie: a point just short of the end is narrowed there too.
+        if !self.closed && (best == 0 || best == steps) && self.is_closed() {
+            let other = if best == 0 {
+                narrow(steps as f64 - 1.0, steps as f64)
             } else {
-                low = one;
+                narrow(0.0, 1.0)
+            };
+            if distance(other) < distance(found) {
+                return other;
             }
         }
-        wrap_parameter(0.5 * (low + high), from, to, self.closed)
+        found
     }
 
     /// Solve tangency from an external point near a knot-parameter seed.
@@ -811,6 +827,26 @@ pub struct NurbsSurface3 {
     u_closed: bool,
     v_closed: bool,
     v_reversed: bool,
+    samples: Samples,
+}
+
+/// The coarse grid the nearest-point search starts from, evaluated once a
+/// surface: it depends on the surface alone, and a cut walking a spline
+/// across a patch asked it tens of thousands of times. Not part of what the
+/// surface is — two surfaces equal but for it are equal.
+#[derive(Clone, Default)]
+struct Samples(std::sync::OnceLock<Vec<(f64, f64, [f64; 3])>>);
+
+impl PartialEq for Samples {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for Samples {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("..")
+    }
 }
 
 impl NurbsSurface3 {
@@ -877,6 +913,7 @@ impl NurbsSurface3 {
             u_closed,
             v_closed,
             v_reversed: false,
+            samples: Samples::default(),
         })
     }
 
@@ -992,6 +1029,7 @@ impl NurbsSurface3 {
             u_closed,
             v_closed,
             v_reversed: false,
+            samples: Samples::default(),
         })
     }
 
@@ -1003,6 +1041,7 @@ impl NurbsSurface3 {
 
     pub fn with_v_reversed(mut self, reversed: bool) -> Self {
         self.v_reversed = reversed;
+        self.samples = Samples::default();
         self
     }
 
@@ -1044,16 +1083,22 @@ impl NurbsSurface3 {
             return None;
         }
         let target = Vec3::from(point);
-        let mut best = (f64::INFINITY, u0, v0);
-        for u_index in 0..=GRID {
-            let u = u0 + (u1 - u0) * u_index as f64 / GRID as f64;
-            for v_index in 0..=GRID {
-                let v = v0 + (v1 - v0) * v_index as f64 / GRID as f64;
-                let distance =
-                    (Vec3::from(self.point_at_knot(u, v)) - target).length_squared();
-                if distance.is_finite() && distance < best.0 {
-                    best = (distance, u, v);
+        let samples = self.samples.0.get_or_init(|| {
+            let mut samples = Vec::with_capacity((GRID + 1) * (GRID + 1));
+            for u_index in 0..=GRID {
+                let u = u0 + (u1 - u0) * u_index as f64 / GRID as f64;
+                for v_index in 0..=GRID {
+                    let v = v0 + (v1 - v0) * v_index as f64 / GRID as f64;
+                    samples.push((u, v, self.point_at_knot(u, v)));
                 }
+            }
+            samples
+        });
+        let mut best = (f64::INFINITY, u0, v0);
+        for (u, v, at) in samples {
+            let distance = (Vec3::from(*at) - target).length_squared();
+            if distance.is_finite() && distance < best.0 {
+                best = (distance, *u, *v);
             }
         }
         if !best.0.is_finite() {
@@ -1386,6 +1431,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_point_just_short_of_a_clamped_loops_end_projects_there() {
+        let w = std::f64::consts::FRAC_PI_4.cos();
+        let circle = NurbsCurve3::new(
+            2,
+            vec![
+                [1.0, 0.0, 0.0], [1.0, -1.0, 0.0], [0.0, -1.0, 0.0], [-1.0, -1.0, 0.0],
+                [-1.0, 0.0, 0.0], [-1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ],
+            vec![0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0],
+            Some(vec![1.0, w, 1.0, w, 1.0, w, 1.0, w, 1.0]),
+        )
+        .unwrap();
+        let below = [0.01_f64.cos(), 0.01_f64.sin(), 0.0];
+        let on = circle.point_at_knot(circle.parameter_at(below));
+        assert!(Vec3::from(on).distance(Vec3::from(below)) < 1e-9, "{on:?}");
+    }
 
     fn helix_points() -> Vec<[f64; 3]> {
         vec![
