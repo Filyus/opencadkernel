@@ -39,7 +39,13 @@ pub struct Written {
 /// which record refers to a body from outside the ACIS stream is the caller's
 /// business, not this function's.
 pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappendable> {
-    if !body.validate().is_empty() {
+    // A non-manifold edge is legal ACIS: its coedges' partners form one
+    // ring round the edge (see `radial_next`). Anything else is not.
+    if body
+        .validate()
+        .iter()
+        .any(|flaw| !matches!(flaw, crate::brep::Flaw::NonManifoldEdge(_)))
+    {
         return Err(Unappendable::Inconsistent);
     }
     let before = document.record_count();
@@ -147,7 +153,7 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
                 .ok_or(Unappendable::Inconsistent)?;
             let next = ring.coedges[(order + 1) % count];
             let previous = ring.coedges[(order + count - 1) % count];
-            let partner = body.partner(*coedge).map(|c| ids.coedge(c)).unwrap_or(NULL);
+            let partner = body.radial_next(*coedge).map(|c| ids.coedge(c)).unwrap_or(NULL);
             set(
                 document,
                 ids.coedge(*coedge),
@@ -188,7 +194,9 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
                 pointer(ids.shell(face.owner)),
                 null(),
                 pointer(ids.surface(face.surface)),
-                sense(face.forward),
+                // A torus written with a negative minor radius faces into
+                // its tube once read, so the face turns back for it.
+                sense(face.forward != inward_torus(body.surfaces.get(face.surface))),
                 SatToken::Ident("single".to_string()),
             ],
         );
@@ -722,6 +730,10 @@ fn pointer(id: i32) -> SatToken {
 
 pub(super) fn null() -> SatToken {
     pointer(NULL)
+}
+
+fn inward_torus(surface: Option<&Surface>) -> bool {
+    matches!(surface, Some(Surface::Torus(torus)) if torus.minor_radius < 0.0)
 }
 
 fn sense(forward: bool) -> SatToken {

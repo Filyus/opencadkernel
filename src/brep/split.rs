@@ -55,12 +55,19 @@ pub fn split_edge(body: &mut Body, edge: EdgeKey, parameter: f64) -> Option<(Edg
     }
 
     // Resolve every pcurve before changing the shared topology.
+    let point = body.curves.get(original.curve)?.point_at(parameter);
     let mut coedges = Vec::with_capacity(original.coedges.len());
     for key in &original.coedges {
         let existing = body.coedges.get(*key)?.clone();
         let (near_pcurve, far_pcurve) = match existing.pcurve.as_ref() {
             Some(curve) => {
-                let at = if existing.forward { across } else { 1.0 - across };
+                let guess = if existing.forward { across } else { 1.0 - across };
+                let surface = body
+                    .loops
+                    .get(existing.owner)
+                    .and_then(|ring| body.faces.get(ring.owner))
+                    .and_then(|face| body.surfaces.get(face.surface));
+                let at = surface.map_or(guess, |surface| pcurve_at(surface, curve, point, guess));
                 let (first, second) = split_pcurve(curve, at)?;
                 if existing.forward {
                     (Some(first), Some(second))
@@ -78,7 +85,6 @@ pub fn split_edge(body: &mut Body, edge: EdgeKey, parameter: f64) -> Option<(Edg
         coedges.push((*key, existing, near_pcurve, far_pcurve));
     }
 
-    let point = body.curves.get(original.curve)?.point_at(parameter);
     let middle = body.vertices.insert(Vertex {
         point,
         provenance: Provenance::Synthesized,
@@ -129,6 +135,39 @@ pub fn split_edge(body: &mut Body, edge: EdgeKey, parameter: f64) -> Option<(Edg
     }
 
     Some((edge, far))
+}
+
+/// Where on a pcurve the surface passes through `point`. Its parameter need
+/// not keep pace with its edge's — a circle rim on a spline surface runs at
+/// the surface's own rate — so the edge's fraction is only where to start.
+fn pcurve_at(
+    surface: &super::geometry::Surface,
+    pcurve: &crate::geom2d::Curve,
+    point: [f64; 3],
+    guess: f64,
+) -> f64 {
+    let gap = |t: f64| {
+        let [u, v] = pcurve.point_at(t);
+        Vec3::from(surface.point_at(u, v)).distance(Vec3::from(point))
+    };
+    const SAMPLES: usize = 64;
+    let best = (0..=SAMPLES)
+        .map(|step| step as f64 / SAMPLES as f64)
+        .chain(std::iter::once(guess))
+        .min_by(|a, b| gap(*a).total_cmp(&gap(*b)))
+        .unwrap_or(guess);
+    let step = 1.0 / SAMPLES as f64;
+    let (mut low, mut high) = ((best - step).max(0.0), (best + step).min(1.0));
+    for _ in 0..60 {
+        let third = (high - low) / 3.0;
+        if gap(low + third) < gap(high - third) {
+            high -= third;
+        } else {
+            low += third;
+        }
+    }
+    let found = 0.5 * (low + high);
+    if gap(found) <= gap(guess) { found } else { guess }
 }
 
 fn split_pcurve(
@@ -234,14 +273,76 @@ pub fn split_face(
     cutter: &Curve3,
     tolerance: f64,
 ) -> Option<[FaceKey; 2]> {
-    let mut candidate = body.clone();
+    // Most tries cut nothing and leave the body as it was; it is copied
+    // only once a cut starts changing it.
+    let mut candidate = std::borrow::Cow::Borrowed(&*body);
     let result = split_face_in_place(&mut candidate, face, cutter, tolerance)?;
+    let candidate = candidate.into_owned();
+    let before = planar_area(body, face);
+    // On a plane the halves share out the face's area. A cut bridging a hole
+    // to the rim divides nothing and hands the one face back twice.
+    if let (true, Some(whole), Some(kept), Some(made)) = (
+        result[0] != result[1],
+        before,
+        planar_area(&candidate, result[0]),
+        planar_area(&candidate, result[1]),
+    ) {
+        // Each half on the face's own side, too: a half walked inside out
+        // carries the region negated, and the other half covers it twice.
+        let scale = whole.abs() + kept.abs() + made.abs();
+        if (whole - kept - made).abs() > 1e-3 * scale
+            || kept * whole <= 0.0
+            || made * whole <= 0.0
+        {
+            return None;
+        }
+    }
     *body = candidate;
     Some(result)
 }
 
+/// A planar face's area, measured round its loops: holes, walked the other
+/// way, take theirs off. `None` for a face on any other surface.
+fn planar_area(body: &Body, face: FaceKey) -> Option<f64> {
+    planar_measure(body, face).map(|(area, _)| area)
+}
+
+/// A planar face's area and the length round all its loops.
+pub(super) fn planar_measure(body: &Body, face: FaceKey) -> Option<(f64, f64)> {
+    let node = body.faces.get(face)?;
+    let super::geometry::Surface::Plane(plane) = body.surfaces.get(node.surface)? else {
+        return None;
+    };
+    let normal = Vec3::from(plane.normal()?) * if node.forward { 1.0 } else { -1.0 };
+    let mut area = 0.0;
+    let mut perimeter = 0.0;
+    for ring in &node.loops {
+        let mut walk: Vec<Vec3> = Vec::new();
+        for coedge in &body.loops.get(*ring)?.coedges {
+            let coedge = body.coedges.get(*coedge)?;
+            let edge = body.edges.get(coedge.edge)?;
+            let curve = body.curves.get(edge.curve)?;
+            let steps = if matches!(curve, Curve3::Line(_)) { 1 } else { 256 };
+            for step in 0..steps {
+                let unit = step as f64 / steps as f64;
+                let unit = if coedge.forward { unit } else { 1.0 - unit };
+                walk.push(Vec3::from(curve.point_at(
+                    edge.start_parameter + (edge.end_parameter - edge.start_parameter) * unit,
+                )));
+            }
+        }
+        let first = *walk.first()?;
+        for (index, point) in walk.iter().enumerate() {
+            let next = walk[(index + 1) % walk.len()];
+            area += 0.5 * (*point - first).cross(next - first).dot(normal);
+            perimeter += point.distance(next);
+        }
+    }
+    Some((area, perimeter))
+}
+
 fn split_face_in_place(
-    body: &mut Body,
+    body: &mut std::borrow::Cow<'_, Body>,
     face: FaceKey,
     cutter: &Curve3,
     tolerance: f64,
@@ -251,7 +352,7 @@ fn split_face_in_place(
     let flat_cutter = pcurve::project(&surface, cutter, tolerance)?;
     if matches!(surface, super::geometry::Surface::Sphere(_)) {
         if let Some(result) =
-            split_full_sphere(body, face, &node, &surface, cutter, &flat_cutter)
+            split_full_sphere(body.to_mut(), face, &node, &surface, cutter, &flat_cutter)
         {
             return Some(result);
         }
@@ -306,10 +407,18 @@ fn split_face_in_place(
                             continue;
                         }
                     }
+                    // A sampled image crosses only to within its chords;
+                    // the exact curves settle where.
+                    let sampled = matches!(cutter, Curve3::Nurbs(_))
+                        || matches!(shifted_cutter, crate::geom2d::Curve::Polyline(_))
+                        || matches!(flat_edge, crate::geom2d::Curve::Polyline(_));
                     cross(shifted_cutter, flat_edge, Tolerance::new(tolerance))
                         .into_iter()
                         .map(|crossing| surface.point_at(crossing.point[0], crossing.point[1]))
-                        .map(|point| onto_both(&curve, cutter, point, tolerance))
+                        .map(|point| match sampled {
+                            true => onto_both(&curve, cutter, point, tolerance),
+                            false => point,
+                        })
                         .collect()
                 }
             };
@@ -328,7 +437,13 @@ fn split_face_in_place(
                     edge.start_parameter.max(edge.end_parameter),
                 );
                 let slack = (high - low).abs() * 1e-9;
-                if along < low - slack || along > high + slack {
+                // Just past an end is that end, a crossing exact to where
+                // the corner was put only to within the tolerance.
+                let at_end = |parameter: f64| {
+                    Vec3::from(curve.point_at(parameter)).distance(Vec3::from(point)) <= tolerance
+                };
+                if (along < low - slack && !at_end(low)) || (along > high + slack && !at_end(high))
+                {
                     continue;
                 }
                 if landings.iter().any(|seen| {
@@ -355,23 +470,90 @@ fn split_face_in_place(
     // curve running into the wall it blends into, both on a third surface —
     // crosses nothing a walk can find, yet passes through a corner the
     // boundary already has. The corner is the landing.
-    if matches!(cutter, Curve3::Nurbs(_)) {
-        for (coedge, _) in &boundary_parts {
-            let Some((vertex, _)) = body.coedge_vertices(*coedge) else {
-                continue;
-            };
-            let Some(point) = body.vertices.get(vertex).map(|vertex| vertex.point) else {
-                continue;
-            };
-            let gap = Vec3::from(cutter.point_at(cutter.parameter_at(point)))
-                .distance(Vec3::from(point));
-            let seen = landings
-                .iter()
-                .any(|landing| Vec3::from(landing.point).distance(Vec3::from(point)) <= tolerance);
-            if gap <= tolerance * 10.0 && !seen {
-                let edge = body.coedges.get(*coedge)?.edge;
-                landings.push(Landing { edge, coedge: *coedge, point });
+    // An exact cutter passing through a corner lands there the same way:
+    // crossings at the very ends of edges go unfound — a curve entering a
+    // face at a corner two other cuts made, or between two pieces of itself
+    // already cut.
+    let spline_cutter = matches!(cutter, Curve3::Nurbs(_));
+    let on_cutter = |coedge: CoedgeKey| {
+        body.coedges
+            .get(coedge)
+            .and_then(|coedge| body.edges.get(coedge.edge))
+            .and_then(|edge| body.curves.get(edge.curve))
+            .is_some_and(|curve| same_circle(cutter, curve, tolerance) || curve == cutter)
+    };
+    let cut_before = boundary_parts.iter().any(|(coedge, _)| on_cutter(*coedge));
+    // A closed cutter touching two walls of a corner of a plane has a half
+    // inside the face either way round. The first cut took one; the other
+    // still runs through the face from the ends of that cut, which are its
+    // landings now. The rest of the turn is across from the cut's middle.
+    let rest_inside = closed_period(cutter).is_some()
+        && matches!(surface, super::geometry::Surface::Plane(_))
+        && boundary_parts.iter().any(|(coedge, _)| {
+            if !on_cutter(*coedge) {
+                return false;
             }
+            let Some(edge) = body.coedges.get(*coedge).and_then(|key| body.edges.get(key.edge))
+            else {
+                return false;
+            };
+            let Some(curve) = body.curves.get(edge.curve) else {
+                return false;
+            };
+            let middle = curve.point_at(0.5 * (edge.start_parameter + edge.end_parameter));
+            let period = closed_period(cutter).unwrap_or(0.0);
+            let across = cutter.point_at(cutter.parameter_at(middle) + 0.5 * period);
+            surface.parameters_at(across).is_some_and(|(u, v)| {
+                pcurve::contains_parameter_facing(
+                    &surface,
+                    &original_boundary,
+                    [u, v],
+                    Tolerance::new(tolerance),
+                    node.forward,
+                ) && original_boundary.iter().all(|edge| distance_to(edge, [u, v]) > tolerance)
+            })
+        });
+    let mut cut_ends: Vec<[f64; 3]> = Vec::new();
+    for (coedge, _) in &boundary_parts {
+        let Some((vertex, _)) = body.coedge_vertices(*coedge) else {
+            continue;
+        };
+        // The corner where the cutter's own edge ends is where it was
+        // cut before, not a crossing.
+        // The one before it in its own loop: the parts run loop after loop.
+        let previous = body.coedges.get(*coedge).and_then(|node| {
+            let ring = &body.loops.get(node.owner)?.coedges;
+            let at = ring.iter().position(|key| key == coedge)?;
+            ring.get((at + ring.len() - 1) % ring.len()).copied()
+        });
+        if !spline_cutter
+            && !rest_inside
+            && (on_cutter(*coedge) || previous.is_some_and(on_cutter))
+        {
+            continue;
+        }
+        let Some(point) = body.vertices.get(vertex).map(|vertex| vertex.point) else {
+            continue;
+        };
+        let gap = Vec3::from(cutter.point_at(cutter.parameter_at(point)))
+            .distance(Vec3::from(point));
+        let seen = landings
+            .iter()
+            .any(|landing| Vec3::from(landing.point).distance(Vec3::from(point)) <= tolerance);
+        let near = if spline_cutter { tolerance * 10.0 } else { tolerance };
+        // An end of the cut is on the cutter however far off it reads: a
+        // corner where it ran tangent into a wall is placed only roughly.
+        // A crossing found beside it, where the cutter ran tangent, is it.
+        let cut_end = rest_inside && (on_cutter(*coedge) || previous.is_some_and(on_cutter));
+        if cut_end {
+            landings.retain(|landing| {
+                Vec3::from(landing.point).distance(Vec3::from(point)) > tolerance
+            });
+            cut_ends.push(point);
+        }
+        if (gap <= near && !seen) || cut_end {
+            let edge = body.coedges.get(*coedge)?.edge;
+            landings.push(Landing { edge, coedge: *coedge, point });
         }
     }
     // A spline's fit: a thousandth of the spline, however short the stretch
@@ -388,6 +570,62 @@ fn split_face_in_place(
         }
         _ => 0.0,
     };
+    // A traced cutter crosses an edge where the exact curves meet only to
+    // within its fit, and near a corner it crosses both edges there: two
+    // landings a hair apart for one crossing at the corner.
+    // A spline edge — a file's fitted intersection — is crossed by an exact
+    // cutter only to within its own fit as well.
+    let edge_fit = |edge: EdgeKey| -> f64 {
+        let Some(node) = body.edges.get(edge) else {
+            return 0.0;
+        };
+        let Some(curve @ Curve3::Nurbs(_)) = body.curves.get(node.curve) else {
+            return 0.0;
+        };
+        let at = |step: usize| {
+            let t = step as f64 / 16.0;
+            Vec3::from(curve.point_at(node.start_parameter * (1.0 - t) + node.end_parameter * t))
+        };
+        let first = at(0);
+        (1..=16).map(|step| at(step).distance(first)).fold(0.0, f64::max) * 1e-4
+    };
+    let snapping = spline_size > 0.0 || landings.iter().any(|landing| edge_fit(landing.edge) > 0.0);
+    if snapping {
+        // A landing a fit from a corner of its edge is that corner: cutting
+        // there instead leaves an edge a fit long beside it.
+        for landing in &mut landings {
+            let fit = tolerance.max(spline_size * 1e-4).max(edge_fit(landing.edge));
+            let corners = body
+                .edges
+                .get(landing.edge)
+                .map(|edge| [edge.start, edge.end])
+                .into_iter()
+                .flatten()
+                .filter_map(|vertex| body.vertices.get(vertex).map(|vertex| vertex.point));
+            if let Some(corner) = corners
+                .filter(|corner| Vec3::from(*corner).distance(Vec3::from(landing.point)) <= fit)
+                .min_by(|a, b| {
+                    let gap = |c: &[f64; 3]| Vec3::from(*c).distance(Vec3::from(landing.point));
+                    gap(a).total_cmp(&gap(b))
+                })
+            {
+                landing.point = corner;
+            }
+        }
+        // Two landings snapped onto one corner are one landing — unless they
+        // are the two uses of one seam edge, as when they were found.
+        let mut kept: Vec<Landing> = Vec::with_capacity(landings.len());
+        for landing in landings {
+            let seen = |other: &Landing| {
+                Vec3::from(other.point).distance(Vec3::from(landing.point)) <= tolerance
+                    && (other.edge != landing.edge || other.coedge == landing.coedge)
+            };
+            if !kept.iter().any(seen) {
+                kept.push(landing);
+            }
+        }
+        landings = kept;
+    }
     let fit_over = |from: f64, to: f64| {
         let chord = Vec3::from(cutter.point_at(from)).distance(Vec3::from(cutter.point_at(to)));
         tolerance.max(1e-3 * chord.max(spline_size))
@@ -395,32 +633,65 @@ fn split_face_in_place(
     let inside = |parameter: f64| {
         let (u, v) = surface.parameters_at(cutter.point_at(parameter))?;
         Some(periodic_points([u, v], periods).into_iter().any(|point| {
-            pcurve::contains_parameter(
+            pcurve::contains_parameter_facing(
                 &surface,
                 &original_boundary,
                 point,
                 Tolerance::new(tolerance),
+                node.forward,
             )
         }))
     };
     let strictly_inside = |parameter: f64| {
         let (u, v) = surface.parameters_at(cutter.point_at(parameter))?;
         Some(periodic_points([u, v], periods).into_iter().any(|point| {
-            pcurve::contains_parameter(
+            pcurve::contains_parameter_facing(
                 &surface,
                 &original_boundary,
                 point,
                 Tolerance::new(tolerance),
+                node.forward,
             ) && original_boundary
                 .iter()
                 .all(|edge| distance_to(edge, point) > tolerance)
         }))
     };
+    // Whether the stretch of the cutter between two parameters runs along the
+    // boundary: on it halfway, and a quarter of the way from either end too.
+    // A cut that only touches the boundary halfway — an arc grazing a
+    // straight edge, where a round meets the wall it is tangent to — still
+    // divides the face.
+    let along = |from: f64, to: f64| {
+        let on = |fraction: f64| {
+            on_boundary(
+                body,
+                &boundary_parts,
+                cutter,
+                cutter.point_at(from + (to - from) * fraction),
+                fit_over(from, to),
+                tolerance,
+            )
+        };
+        on(0.5) && (on(0.25) || on(0.75))
+    };
     if matches!(surface, super::geometry::Surface::Plane(_)) {
         if let Some(period) = closed_period(cutter) {
-            let step = period * 1.0e-6;
             landings.retain(|landing| {
+                // One end of a cut whose other half is still to make: along
+                // the cut one way, into the face the other.
+                if cut_ends.contains(&landing.point) {
+                    return true;
+                }
                 let parameter = cutter.parameter_at(landing.point);
+                // Far enough along to leave the containment test's own
+                // tolerance behind: where the cutter crosses at a shallow
+                // angle, a millionth of a turn stays within it either side
+                // and a real crossing read as a touch.
+                let probe = period * 1.0e-6;
+                let speed = Vec3::from(cutter.point_at(parameter + probe))
+                    .distance(Vec3::from(cutter.point_at(parameter)))
+                    / probe;
+                let step = probe.max(if speed > 0.0 { 50.0 * tolerance / speed } else { 0.0 });
                 matches!(
                     (inside(parameter - step), inside(parameter + step)),
                     (Some(before), Some(after)) if before != after
@@ -428,13 +699,30 @@ fn split_face_in_place(
             });
         }
     }
+    // A closed cutter touching the boundary at two places or more — a
+    // fillet's circle against both walls of its corner — divides the face
+    // there as surely as one crossing it, though no crossing was found.
+    // A face cut along this curve before meets it at that cut's ends,
+    // which are not touches.
+    // A closed cutter crossing no edge is wholly inside the face or wholly
+    // out of it, touching or not; out of it, nothing more needs asking.
+    let mut touches = None;
     if landings.is_empty() {
         let period = closed_period(cutter)?;
-        // A closed cutter crossing no edge is wholly inside the face or
-        // wholly out of it; out of it, nothing more needs asking.
         if inside(0.0) == Some(false) && inside(period * 0.5) == Some(false) {
             return None;
         }
+        if !cut_before {
+            let found = boundary_touches(body, &boundary_parts, cutter, period, tolerance);
+            if found.len() >= 2 {
+                landings = found;
+            } else {
+                touches = Some(found);
+            }
+        }
+    }
+    if landings.is_empty() {
+        let period = closed_period(cutter)?;
         // A closed cutter that already is one of the face's edges was cut
         // before: the landings skip it as their own curve, and cutting
         // between the loops again peeled a sliver off the same band for ever
@@ -454,12 +742,19 @@ fn split_face_in_place(
         // it is a closed curve, and an annulus cut by a circle between its
         // rims keeps one rim on each side (#1563's collar under a washer).
         let mut enclosed = Vec::new();
+        // On a curved surface a closed cutter either runs once round it —
+        // between the face's rims, cutting a band in two — or closes on
+        // itself in `(u, v)`, an island like one on a plane (two cones
+        // crossing side by side).
+        let (head, tail) = (flat_cutter.point_at(0.0), flat_cutter.point_at(1.0));
+        let travel = (tail[0] - head[0]).abs().max((tail[1] - head[1]).abs());
+        let wraps = periods.iter().flatten().any(|period| (travel - period).abs() < period * 1e-3);
         if node.loops.len() > 1 {
-            if !matches!(surface, super::geometry::Surface::Plane(_))
+            if (!matches!(surface, super::geometry::Surface::Plane(_)) && wraps)
                 || matches!(flat_cutter, crate::geom2d::Curve::Line(_))
             {
                 return split_closed_between_loops(
-                    body,
+                    body.to_mut(),
                     face,
                     &node,
                     &surface,
@@ -470,7 +765,11 @@ fn split_face_in_place(
                 );
             }
             for ring in &node.loops {
-                let first = *body.loops.get(*ring)?.coedges.first()?;
+                // An apex loop has no image to enclose; the island, not
+                // running round the axis, cannot hold it.
+                let Some(&first) = body.loops.get(*ring)?.coedges.first() else {
+                    continue;
+                };
                 let boundary = &boundary_parts.iter().find(|(key, _)| *key == first)?.1;
                 if crate::geom2d::contains(
                     std::slice::from_ref(&flat_cutter),
@@ -480,6 +779,13 @@ fn split_face_in_place(
                     enclosed.push(*ring);
                 }
             }
+        }
+        // An island lies inside the face all the way round. One reaching
+        // out of it crosses the boundary — at corners the landings passed
+        // over — and cut as an island it copied a piece of the face over
+        // a neighbour that already had it.
+        if (0..8).any(|index| inside(period * (index as f64 + 0.5) / 8.0) == Some(false)) {
+            return None;
         }
         let start_parameter = (0..16)
             .map(|index| period * index as f64 / 16.0)
@@ -522,10 +828,29 @@ fn split_face_in_place(
         }
         let island_forward = (alignment > 0.0) == node.forward;
 
-        let seam = body.vertices.insert(Vertex {
-            point,
-            provenance: Provenance::Synthesized,
-        });
+        // A cutter touching the boundary at one point — a fillet's circle
+        // meeting the walls beside it — bounds no island: the face would
+        // hang from the rest by that point. The touch becomes a corner the
+        // outer loop passes through on its way round the cut.
+        let touch = touches
+            .unwrap_or_else(|| boundary_touches(body, &boundary_parts, cutter, period, tolerance))
+            .pop();
+        let body = body.to_mut();
+        let (seam, start_parameter, attached) = match touch {
+            Some(landing) => {
+                let vertex = vertex_at(body, &landing, tolerance)?;
+                let at = body.vertices.get(vertex)?.point;
+                let ring = body.coedges.get(landing.coedge)?.owner;
+                (vertex, cutter.parameter_at(at), Some(ring))
+            }
+            None => {
+                let seam = body.vertices.insert(Vertex {
+                    point,
+                    provenance: Provenance::Synthesized,
+                });
+                (seam, start_parameter, None)
+            }
+        };
         let curve = body.curves.insert(cutter.clone());
         let cut = body.edges.insert(Edge {
             curve,
@@ -537,11 +862,14 @@ fn split_face_in_place(
             provenance: Provenance::Synthesized,
         });
 
-        let hole_ring = body.loops.insert(Loop {
-            coedges: Vec::new(),
-            owner: face,
-            provenance: Provenance::Synthesized,
-        });
+        let hole_ring = match attached {
+            Some(ring) => ring,
+            None => body.loops.insert(Loop {
+                coedges: Vec::new(),
+                owner: face,
+                provenance: Provenance::Synthesized,
+            }),
+        };
         let hole = body.coedges.insert(Coedge {
             edge: cut,
             forward: !island_forward,
@@ -549,10 +877,21 @@ fn split_face_in_place(
             owner: hole_ring,
             provenance: Provenance::Synthesized,
         });
-        body.loops.get_mut(hole_ring)?.coedges = vec![hole];
-        let kept = body.faces.get_mut(face)?;
-        kept.loops.push(hole_ring);
-        kept.provenance.soil();
+        match attached {
+            // Round the cut and back, between the two coedges meeting at
+            // the touch.
+            Some(ring) => {
+                let at = body.loops.get(ring)?.coedges.iter().position(|coedge| {
+                    body.coedge_vertices(*coedge).is_some_and(|(_, end)| end == seam)
+                })?;
+                body.loops.get_mut(ring)?.coedges.insert(at + 1, hole);
+            }
+            None => {
+                body.loops.get_mut(hole_ring)?.coedges = vec![hole];
+                body.faces.get_mut(face)?.loops.push(hole_ring);
+            }
+        }
+        body.faces.get_mut(face)?.provenance.soil();
 
         let other = body.faces.insert(Face {
             surface: node.surface,
@@ -648,17 +987,20 @@ fn split_face_in_place(
         }
         (None, Some(period)) => {
             // A half already cut along is boundary now, not inside.
+            // A half that only grazes the boundary halfway is open where it
+            // runs inside the face either side of that, not outside it.
             let open = |from: f64, to: f64| -> Option<bool> {
-                let parameter = 0.5 * (from + to);
-                let along = on_boundary(
+                let at = |fraction: f64| from + (to - from) * fraction;
+                let grazing = on_boundary(
                     body,
                     &boundary_parts,
                     cutter,
-                    cutter.point_at(parameter),
+                    cutter.point_at(at(0.5)),
                     fit_over(from, to),
                     tolerance,
                 );
-                Some(inside(parameter)? && !along)
+                let beside = !grazing || (inside(at(0.25))? && inside(at(0.75))?);
+                Some(inside(at(0.5))? && !along(from, to) && beside)
             };
             let direct = open(low_parameter, high_parameter)?;
             let wrapped = open(high_parameter, low_parameter + period)?;
@@ -704,6 +1046,18 @@ fn split_face_in_place(
                 high = Vec3::new(high.x.max(p.x), high.y.max(p.y), high.z.max(p.z));
             }
         }
+        // A cone face reaching its apex reaches past its edges.
+        let apex_loop = node
+            .loops
+            .iter()
+            .any(|ring| body.loops.get(*ring).is_some_and(|ring| ring.coedges.is_empty()));
+        if let (super::geometry::Surface::Cone(cone), true) = (&surface, apex_loop) {
+            let p = Vec3::from(surface.point_at(0.0, cone.radius / cone.half_angle.tan()));
+            if p.is_finite() {
+                low = Vec3::new(low.x.min(p.x), low.y.min(p.y), low.z.min(p.z));
+                high = Vec3::new(high.x.max(p.x), high.y.max(p.y), high.z.max(p.z));
+            }
+        }
         if low.is_finite() && high.is_finite() {
             let pad = low.distance(high) + tolerance * 10.0;
             let outside = (0..=8).any(|step| {
@@ -734,25 +1088,40 @@ fn split_face_in_place(
     // A cut that runs along the boundary divides nothing. It happens
     // naturally the moment a face has already been cut: the new edge lies on
     // the cutter, its two ends are vertices, and the next pass finds the same
-    // two landings and cuts again — the same face for ever. Asked of the
-    // midpoint rather than the ends, since a genuine cut also touches the
-    // boundary at both of those.
+    // two landings and cuts again — the same face for ever. Asked inside
+    // the cut rather than at the ends, since a genuine cut also touches the
+    // boundary at both of those, and not halfway alone, since one may graze
+    // the boundary there.
     // Asked of the edges' own curves too: a sampled boundary image sits off
     // its edge by more than the tolerance between samples.
-    let midway = cutter.point_at(0.5 * (start_parameter + end_parameter));
-    let (u, v) = surface.parameters_at(midway)?;
-    if periodic_points([u, v], periods).into_iter().any(|point| {
-        original_boundary
-            .iter()
-            .any(|edge| distance_to(edge, point) <= tolerance)
-    }) || on_boundary(
-        body,
-        &boundary_parts,
-        cutter,
-        midway,
-        fit_over(start_parameter, end_parameter),
-        tolerance,
-    ) {
+    let on_image = |parameter: f64| -> Option<bool> {
+        let (u, v) = surface.parameters_at(cutter.point_at(parameter))?;
+        Some(periodic_points([u, v], periods).into_iter().any(|point| {
+            original_boundary.iter().any(|edge| distance_to(edge, point) <= tolerance)
+        }))
+    };
+    let span = end_parameter - start_parameter;
+    let imaged = on_image(start_parameter + span * 0.5)?
+        && (on_image(start_parameter + span * 0.25)? || on_image(start_parameter + span * 0.75)?);
+    // A stretch cut before is an edge of the body already, between the same
+    // two corners: a cutter touching the boundary where it was cut finds
+    // those corners again and would peel the same sliver off for ever.
+    let cut_already = || {
+        let ends = [start_parameter, end_parameter, start_parameter + span * 0.5]
+            .map(|at| Vec3::from(cutter.point_at(at)));
+        body.edges.iter().any(|(_, edge)| {
+            body.curves.get(edge.curve).is_some_and(|curve| curve == cutter)
+                && [edge.start_parameter, edge.end_parameter].iter().all(|at| {
+                    let point = Vec3::from(cutter.point_at(*at));
+                    point.distance(ends[0]) <= tolerance || point.distance(ends[1]) <= tolerance
+                })
+                && Vec3::from(cutter.point_at(0.5 * (edge.start_parameter + edge.end_parameter)))
+                    .distance(ends[2])
+                    <= tolerance
+        })
+    };
+    let traced = matches!(cutter, Curve3::Nurbs(spline) if spline.degree() > 1);
+    if imaged || along(start_parameter, end_parameter) || (traced && cut_already()) {
         return None;
     }
 
@@ -760,6 +1129,7 @@ fn split_face_in_place(
     let (first_ring, second_ring) = (ring_of(&landings[0])?, ring_of(&landings[1])?);
 
     // Mutate the boundary only after proving this is a new cut.
+    let body = body.to_mut();
     let first = vertex_at(body, &landings[0], tolerance)?;
     let second = vertex_at(body, &landings[1], tolerance)?;
     if first == second && !same_vertex_landing {
@@ -899,7 +1269,34 @@ fn split_face_in_place(
     // A cut starting and ending at one vertex gives no ends to go by; the
     // near arc has to be on the face's side of the cut instead.
     let near_forward = if same_vertex_landing {
-        near_side_forward(body, &surface, cutter, start_parameter, &near, node.forward)?
+        // Round a surface closed both ways the side test cannot tell the
+        // halves apart; the cut has to close the near arc's walk in (u, v),
+        // and only one way round does.
+        let closing = || -> Option<bool> {
+            if periods.iter().any(Option::is_none) {
+                return None;
+            }
+            let parts = pcurve::face_boundary_parts(body, face, tolerance)?;
+            let mut walked = [0.0, 0.0];
+            for coedge in &near {
+                let piece = &parts.iter().find(|(key, _)| key == coedge)?.1;
+                let (from, to) = (piece.point_at(0.0), piece.point_at(1.0));
+                walked = [walked[0] + to[0] - from[0], walked[1] + to[1] - from[1]];
+            }
+            let (from, to) = (flat_cutter.point_at(0.0), flat_cutter.point_at(1.0));
+            let cut = [to[0] - from[0], to[1] - from[1]];
+            let gap = |sign: f64| (walked[0] + sign * cut[0]).hypot(walked[1] + sign * cut[1]);
+            let (forward, backward) = (gap(1.0), gap(-1.0));
+            let turn = periods.iter().flatten().fold(f64::INFINITY, |least, p| least.min(*p));
+            (forward.min(backward) < turn * 1e-3 && forward.max(backward) > turn * 0.5)
+                .then_some(forward < backward)
+        };
+        match closing() {
+            Some(forward) => forward,
+            None => {
+                near_side_forward(body, &surface, cutter, start_parameter, &near, node.forward)?
+            }
+        }
     } else {
         sense(second)
     };
@@ -956,14 +1353,41 @@ fn split_face_in_place(
     // The face's other loops — its holes, a band's far rim — go with
     // whichever half they lie in. A loop neither half's own boundary closes
     // round belongs to the half that wraps round the surface with it.
-    let extras: Vec<(LoopKey, [f64; 2])> = node
+    // A cone's apex loop has no curve to stand on; a point just short of
+    // the apex, on the face's side of it, stands for it.
+    let apex_point = || -> Option<[f64; 2]> {
+        let super::geometry::Surface::Cone(cone) = &surface else {
+            return None;
+        };
+        let apex = cone.radius / cone.half_angle.tan();
+        let samples: Vec<[f64; 2]> = boundary_parts
+            .iter()
+            .filter(|(coedge, _)| ring.contains(coedge))
+            .map(|(_, piece)| piece.point_at(0.5))
+            .collect();
+        let count = samples.len() as f64;
+        let u = samples.iter().map(|point| point[0]).sum::<f64>() / count;
+        let v = samples.iter().map(|point| point[1]).sum::<f64>() / count;
+        (apex.is_finite() && count > 0.0).then_some([u, apex - (apex - v) * 1e-3])
+    };
+    // A few points round each loop: one touching the cut — a hole the cut
+    // runs tangent to — is in both halves and settles nothing.
+    let extras: Vec<(LoopKey, Vec<[f64; 2]>)> = node
         .loops
         .iter()
         .filter(|ring| **ring != ring_key)
         .map(|ring| {
-            let first = *body.loops.get(*ring)?.coedges.first()?;
-            let piece = &boundary_parts.iter().find(|(key, _)| *key == first)?.1;
-            Some((*ring, piece.point_at(0.5)))
+            let coedges = &body.loops.get(*ring)?.coedges;
+            if coedges.is_empty() {
+                return Some((*ring, vec![apex_point()?]));
+            }
+            let mut points = Vec::new();
+            for coedge in coedges {
+                if let Some((_, piece)) = boundary_parts.iter().find(|(key, _)| key == coedge) {
+                    points.extend([0.5, 0.25, 0.75].map(|at| piece.point_at(at)));
+                }
+            }
+            (!points.is_empty()).then_some((*ring, points))
         })
         .collect::<Option<_>>()?;
     if !extras.is_empty() {
@@ -979,7 +1403,8 @@ fn split_face_in_place(
             (start[0] - end[0]).hypot(start[1] - end[1]) > turn * 0.5
         };
         let inside = |boundary: &[crate::geom2d::Curve], point: [f64; 2]| {
-            pcurve::contains_parameter(&surface, boundary, point, Tolerance::new(tolerance))
+            let tolerance = Tolerance::new(tolerance);
+            pcurve::contains_parameter_facing(&surface, boundary, point, tolerance, node.forward)
         };
         // Cut off a hole, the cap between the cut and the hole's edge winds
         // against the hole, and the rest still winds with it: that rest keeps
@@ -1009,10 +1434,19 @@ fn split_face_in_place(
         };
         let mut kept_loops = vec![ring_key];
         let mut moved_loops = vec![other_ring];
-        for (ring, point) in extras {
-            let to_far = match (inside(&near_boundary, point), inside(&far_boundary, point)) {
-                (false, true) => true,
-                (true, false) => false,
+        for (ring, points) in extras {
+            // The points that tell the halves apart vote.
+            let mut votes = 0i32;
+            for point in &points {
+                match (inside(&near_boundary, *point), inside(&far_boundary, *point)) {
+                    (false, true) => votes += 1,
+                    (true, false) => votes -= 1,
+                    _ => {}
+                }
+            }
+            let to_far = match votes.signum() {
+                1 => true,
+                -1 => false,
                 _ => far_keeps,
             };
             if to_far {
@@ -1173,6 +1607,37 @@ pub(super) fn reverse_closed_pcurve(curve: &crate::geom2d::Curve) -> Option<crat
 }
 
 /// Divides a periodic band along a closed section.
+/// Which side of a cutter's image `point` lies on, positive to the left of
+/// `direction`. A straight image is one cross product; a curved one running
+/// round a `u` period is compared at `point`'s own `u`.
+fn side_of_image(
+    image: &[[f64; 2]],
+    direction: Vec3,
+    point: [f64; 2],
+    period: Option<f64>,
+) -> Option<f64> {
+    let start = *image.first()?;
+    if image.len() == 2 {
+        return Some(direction.x * (point[1] - start[1]) - direction.y * (point[0] - start[0]));
+    }
+    let period = period?;
+    let low = image.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+    let u = low + (point[0] - low).rem_euclid(period);
+    let v = image
+        .windows(2)
+        .find_map(|pair| {
+            let (a, b) = (pair[0], pair[1]);
+            let inside = a[0].min(b[0]) <= u && u <= a[0].max(b[0]) && a[0] != b[0];
+            inside.then(|| a[1] + (b[1] - a[1]) * (u - a[0]) / (b[0] - a[0]))
+        })
+        // At the image's own ends `u` can sit a rounding outside it.
+        .or_else(|| {
+            let nearest = image.iter().min_by(|a, b| (a[0] - u).abs().total_cmp(&(b[0] - u).abs()));
+            nearest.map(|p| p[1])
+        })?;
+    Some(direction.x * (point[1] - v))
+}
+
 fn split_closed_between_loops(
     body: &mut Body,
     face: FaceKey,
@@ -1183,13 +1648,19 @@ fn split_closed_between_loops(
     boundary_parts: &[(CoedgeKey, crate::geom2d::Curve)],
     period: f64,
 ) -> Option<[FaceKey; 2]> {
-    let crate::geom2d::Curve::Line(line) = flat_cutter else {
-        return None;
-    };
-    let mut direction = Vec3::new(line.end[0] - line.start[0], line.end[1] - line.start[1], 0.0);
+    // The cutter's image runs once round the band: straight along `u` for
+    // a circle round a cylinder, a spline for a traced curve that wavers.
+    // Which side of it a loop lies on is read against the image at the
+    // loop's own `u`.
+    let (start, end) = (flat_cutter.point_at(0.0), flat_cutter.point_at(1.0));
+    let mut direction = Vec3::new(end[0] - start[0], end[1] - start[1], 0.0);
     if direction.length() <= f64::EPSILON {
         return None;
     }
+    let image: Vec<[f64; 2]> = match flat_cutter {
+        crate::geom2d::Curve::Line(line) => vec![line.start, line.end],
+        _ => (0..=128).map(|step| flat_cutter.point_at(step as f64 / 128.0)).collect(),
+    };
     // A circle round a cylinder's axis has a flat image running the way `u`
     // does, whichever way the circle itself turns. The cut's edge runs the
     // way the circle does, so that is the way read off here — a circle whose
@@ -1213,9 +1684,15 @@ fn split_closed_between_loops(
     // one way or the other, a hole nothing.
     let mut negative_turn = 0.0;
     let mut positive_turn = 0.0;
+    // A cone's apex is a loop with no edge: it has no point of its own to
+    // place, but it can only be on the side the rims leave empty.
+    let mut singular = Vec::new();
     for ring in &node.loops {
         let coedges = &body.loops.get(*ring)?.coedges;
-        let first = *coedges.first()?;
+        let Some(&first) = coedges.first() else {
+            singular.push(*ring);
+            continue;
+        };
         let boundary = boundary_parts.iter().find(|(key, _)| *key == first)?.1.clone();
         let point = boundary.point_at(0.5);
         let turn: f64 = coedges
@@ -1226,8 +1703,19 @@ fn split_closed_between_loops(
                 Vec3::new(to[0] - from[0], to[1] - from[1], 0.0).dot(direction)
             })
             .sum();
-        let side = direction.x * (point[1] - line.start[1])
-            - direction.y * (point[0] - line.start[0]);
+        // A cut running round the other way — round a torus's tube rather
+        // than its ring — is read with the two parameters exchanged.
+        let side = if direction.y.abs() > direction.x.abs() {
+            let swapped: Vec<[f64; 2]> = image.iter().map(|p| [p[1], p[0]]).collect();
+            side_of_image(
+                &swapped,
+                Vec3::new(direction.y, direction.x, 0.0),
+                [point[1], point[0]],
+                pcurve::periods(surface)[1],
+            )?
+        } else {
+            side_of_image(&image, direction, point, pcurve::periods(surface)[0])?
+        };
         if side < 0.0 {
             negative.push(*ring);
             negative_turn += turn;
@@ -1238,12 +1726,22 @@ fn split_closed_between_loops(
             return None;
         }
     }
+    if !singular.is_empty() {
+        match (negative.is_empty(), positive.is_empty()) {
+            (true, false) => negative = singular,
+            (false, true) => positive = singular,
+            _ => return None,
+        }
+    }
     if negative.is_empty() || positive.is_empty() {
         return None;
     }
     // Each half is a band: its new rim runs against the rim it keeps. The
     // cut's edge runs the way `direction` does, so its use in the negative
     // half is forward exactly when that half's own rim runs the other way.
+    // A half that is only an apex has no rim; its cut runs against the
+    // other half's, as a rim of its own would.
+    let negative_turn = if negative_turn == 0.0 { -positive_turn } else { negative_turn };
     if negative_turn * positive_turn > 0.0 || negative_turn == 0.0 {
         return None;
     }
@@ -1322,9 +1820,6 @@ fn split_closed_between_loops(
 /// curves it is where: a spline's image is a fit off the spline, and a
 /// corner left there is a fit off the edge the other body cuts along it.
 fn onto_both(edge: &Curve3, cutter: &Curve3, point: [f64; 3], tolerance: f64) -> [f64; 3] {
-    if !matches!(cutter, Curve3::Nurbs(_)) {
-        return point;
-    }
     // Newton on edge(s) = cutter(t), in least squares: both run on one
     // surface, so where they cross the residual vanishes.
     let speed = |curve: &Curve3, at: f64| {
@@ -1333,6 +1828,7 @@ fn onto_both(edge: &Curve3, cutter: &Curve3, point: [f64; 3], tolerance: f64) ->
             / (2.0 * step)
     };
     let (mut s, mut t) = (edge.parameter_at(point), cutter.parameter_at(point));
+    let first_gap = Vec3::from(point).distance(Vec3::from(cutter.point_at(t)));
     for _ in 0..32 {
         let gap = Vec3::from(edge.point_at(s)) - Vec3::from(cutter.point_at(t));
         if gap.length() <= tolerance * 0.01 {
@@ -1349,9 +1845,12 @@ fn onto_both(edge: &Curve3, cutter: &Curve3, point: [f64; 3], tolerance: f64) ->
         t -= (aa * rb - ab * ra) / det;
     }
     let landed = edge.point_at(s);
-    // A step that ran off to another crossing is no refinement.
+    // A step that ran off to another crossing is no refinement. A traced
+    // cutter passes the edge to within its fit, a little more than the
+    // tolerance, still far nearer than the sampled crossing was.
+    let gap = Vec3::from(landed).distance(Vec3::from(cutter.point_at(t)));
     if Vec3::from(landed).distance(Vec3::from(point)) > 0.1 * Vec3::from(point).length().max(1.0)
-        || Vec3::from(landed).distance(Vec3::from(cutter.point_at(t))) > tolerance
+        || (gap > tolerance && gap * 100.0 > first_gap)
     {
         return point;
     }
@@ -1428,9 +1927,6 @@ fn near_side_forward(
         Some(period) => value + period * ((beside - value) / period).round(),
         None => value,
     };
-    let (u0, v0) = surface.parameters_at(cutter.point_at(at))?;
-    let (u1, v1) = surface.parameters_at(cutter.point_at(at + 1.0e-4))?;
-    let along = [unwind(u1, u0) - u0, v1 - v0];
     let sample = body.coedges.get(*near.get(near.len() / 2)?)?;
     let edge = body.edges.get(sample.edge)?;
     let point = body
@@ -1438,6 +1934,20 @@ fn near_side_forward(
         .get(edge.curve)?
         .point_at(0.5 * (edge.start_parameter + edge.end_parameter));
     let (u, v) = surface.parameters_at(point)?;
+    // Read against the cutter where it passes the sample, not where it
+    // starts: half a turn round, which way `u` runs from the start is a
+    // coin toss, and it decided the side.
+    let period_length = closed_period(cutter).unwrap_or(1.0);
+    let (_, nearest) = (0..64)
+        .filter_map(|step| {
+            let t = at + period_length * step as f64 / 64.0;
+            let (cu, cv) = surface.parameters_at(cutter.point_at(t))?;
+            Some(((unwind(cu, u) - u).abs(), (t, cu, cv)))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))?;
+    let (t, u0, v0) = nearest;
+    let (u1, v1) = surface.parameters_at(cutter.point_at(t + 1.0e-4))?;
+    let along = [unwind(u1, u0) - u0, v1 - v0];
     let side = along[0] * (v - v0) - along[1] * (unwind(u, u0) - u0);
     (side != 0.0).then_some((side > 0.0) == face_forward)
 }
@@ -1574,6 +2084,96 @@ struct Landing {
     point: [f64; 3],
 }
 
+/// Where a closed cutter lying in a face touches the face's boundary: per
+/// edge, the boundary point nearest the cutter when that is within the
+/// tolerance of it, one landing for each place touched.
+fn boundary_touches(
+    body: &Body,
+    boundary_parts: &[(CoedgeKey, crate::geom2d::Curve)],
+    cutter: &Curve3,
+    period: f64,
+    tolerance: f64,
+) -> Vec<Landing> {
+    let mut found: Vec<Landing> = Vec::new();
+    // Boxes first: an edge the cutter's box does not reach it cannot touch,
+    // and the search along the cutter is the costly part.
+    let boxed = |points: &mut dyn Iterator<Item = [f64; 3]>| {
+        points.fold(
+            ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]),
+            |(low, high), p| {
+                (
+                    std::array::from_fn(|i| low[i].min(p[i])),
+                    std::array::from_fn(|i| high[i].max(p[i])),
+                )
+            },
+        )
+    };
+    let reach = |(low, high): ([f64; 3], [f64; 3]), grow: f64| {
+        (low.map(|v| v - grow), high.map(|v| v + grow))
+    };
+    let samples = 64;
+    let cutter_box = boxed(&mut (0..=samples).map(|step| {
+        cutter.point_at(period * step as f64 / samples as f64)
+    }));
+    let size = Vec3::from(cutter_box.0).distance(Vec3::from(cutter_box.1));
+    // Chords cut inside a curve by up to its bend; a tenth of the size
+    // covers that at 64 samples.
+    let (cut_low, cut_high) = reach(cutter_box, size * 0.1 + tolerance);
+    for (coedge, _) in boundary_parts {
+        let Some(edge_key) = body.coedges.get(*coedge).map(|coedge| coedge.edge) else {
+            continue;
+        };
+        let Some(edge) = body.edges.get(edge_key) else { continue };
+        let Some(curve) = body.curves.get(edge.curve) else { continue };
+        if same_circle(cutter, curve, tolerance) || curve == cutter {
+            continue;
+        }
+        let (low, high) = (
+            edge.start_parameter.min(edge.end_parameter),
+            edge.start_parameter.max(edge.end_parameter),
+        );
+        let (edge_low, edge_high) = boxed(&mut (0..=16).map(|step| {
+            curve.point_at(low + (high - low) * step as f64 / 16.0)
+        }));
+        let edge_size = Vec3::from(edge_low).distance(Vec3::from(edge_high));
+        let (edge_low, edge_high) = reach((edge_low, edge_high), edge_size * 0.1);
+        if (0..3).any(|i| edge_low[i] > cut_high[i] || edge_high[i] < cut_low[i]) {
+            continue;
+        }
+        // Nearest point of the edge to a point of the cutter, and how far.
+        let gap = |t: f64| {
+            let point = cutter.point_at(t);
+            let on = curve.point_at(curve.parameter_at(point).clamp(low, high));
+            (Vec3::from(point).distance(Vec3::from(on)), on)
+        };
+        let steps = 32;
+        let Some(coarse) = (0..steps)
+            .map(|step| period * step as f64 / steps as f64)
+            .min_by(|a, b| gap(*a).0.total_cmp(&gap(*b).0))
+        else {
+            continue;
+        };
+        let step = period / steps as f64;
+        let (mut from, mut to) = (coarse - step, coarse + step);
+        for _ in 0..60 {
+            let (one, two) = (from + (to - from) / 3.0, to - (to - from) / 3.0);
+            if gap(one).0 < gap(two).0 {
+                to = two;
+            } else {
+                from = one;
+            }
+        }
+        let (distance, on) = gap(0.5 * (from + to));
+        let seen = found
+            .iter()
+            .any(|landing| Vec3::from(landing.point).distance(Vec3::from(on)) <= tolerance);
+        if distance <= tolerance && !seen {
+            found.push(Landing { edge: edge_key, coedge: *coedge, point: on });
+        }
+    }
+    found
+}
+
 /// The vertex at a landing: an existing end of the edge when the cut runs
 /// into a corner, otherwise a new one from splitting the edge there.
 fn vertex_at(body: &mut Body, landing: &Landing, tolerance: f64) -> Option<VertexKey> {
@@ -1584,14 +2184,19 @@ fn vertex_at(body: &mut Body, landing: &Landing, tolerance: f64) -> Option<Verte
         .iter()
         .filter_map(|(key, edge)| (edge.curve == curve_key).then_some(key))
         .collect();
-    for candidate in candidates {
-        let edge = body.edges.get(candidate)?.clone();
+    // A corner already there is the landing, whichever piece of the curve
+    // it ends: splitting an earlier piece first put a second corner on it.
+    for candidate in &candidates {
+        let edge = body.edges.get(*candidate)?;
         for end in [edge.start, edge.end] {
             let point = body.vertices.get(end)?.point;
             if Vec3::from(point).distance(Vec3::from(landing.point)) <= tolerance {
                 return Some(end);
             }
         }
+    }
+    for candidate in candidates {
+        let edge = body.edges.get(candidate)?.clone();
         let parameter = parameter_in_span(
             &curve,
             landing.point,
