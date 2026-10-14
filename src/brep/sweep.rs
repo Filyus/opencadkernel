@@ -4490,13 +4490,16 @@ mod tests {
     }
 
     #[test]
-    fn an_axis_off_the_profiles_plane_is_refused() {
-        // The pieces would sweep into surfaces none of the analytic kinds
-        // describe, and approximating them would lose that they were ever
-        // round.
+    fn an_axis_off_the_profiles_plane_sweeps_rotational_surfaces() {
+        // Tilted against the plane, or parallel to it at a distance: each
+        // piece sweeps an exact rational surface of revolution.
         let profile = ring(&[[1.0, 0.0], [3.0, 0.0], [3.0, 4.0], [1.0, 4.0]]);
-        assert!(revolve(half_plane(), &profile, [0.0; 3], [0.0, 1.0, 1.0], TAU).is_none());
-        assert!(revolve(half_plane(), &profile, [0.0, 5.0, 0.0], [0.0, 0.0, 1.0], TAU).is_none());
+        for (pivot, axis) in [([0.0; 3], [0.0, 1.0, 1.0]), ([0.0, 5.0, 0.0], [0.0, 0.0, 1.0])] {
+            let solid = revolve(half_plane(), &profile, pivot, axis, TAU).expect("turned");
+            assert!(solid.validate().is_empty(), "{:?}", solid.validate());
+            let mass = crate::brep::mass_properties(&solid).expect("mass");
+            assert!(mass.volume > 0.0, "{}", mass.volume);
+        }
     }
 
     #[test]
