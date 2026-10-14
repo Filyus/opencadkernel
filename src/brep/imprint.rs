@@ -194,7 +194,11 @@ pub(super) fn imprint_reaching(
     // the lines, the circle touches the walls at two places and divides the
     // corner off as it should.
     kept.sort_by_key(|(curve, _)| matches!(curve, Curve3::Circle(_) | Curve3::Ellipse(_)));
-    let (curves, found): (Vec<Curve3>, Vec<[Option<Aabb>; 2]>) = kept.into_iter().unzip();
+    let (mut curves, mut found): (Vec<Curve3>, Vec<[Option<Aabb>; 2]>) =
+        kept.into_iter().unzip();
+    let (more, boxes) = chained_meetings(a, b, &curves, &found, tolerance);
+    curves.extend(more);
+    found.extend(boxes);
     // A curve cuts one body only where the other body's faces it was found
     // with are. A traced curve runs round its whole surface, and on a part
     // whose fillets share one torus it otherwise cut every fillet, wherever
@@ -259,6 +263,8 @@ pub(super) fn imprint_reaching(
     // other one of the two; the other body's corner settles which.
     snap_cut_vertices(a, b, tolerance, reach);
     snap_cut_vertices(b, a, tolerance, reach);
+    split_splines_at_corners(b, a, reach);
+    split_splines_at_corners(a, b, reach);
     separate_pinched_loops(a, tolerance);
     separate_pinched_loops(b, tolerance);
     collapse_lenses(a, tolerance);
@@ -267,6 +273,199 @@ pub(super) fn imprint_reaching(
         cuts,
         meetings: count,
     })
+}
+
+/// Two traced meetings that end at one point on a curved face of one body,
+/// joined: each was kept to where both bodies are, so a corner of the other
+/// body standing in the face ends both there — a box's corner in a cone —
+/// and neither alone runs from rim to rim to divide the face. Joined they
+/// do; each joined pair cuts only the body whose face carries it.
+fn chained_meetings(
+    a: &Body,
+    b: &Body,
+    curves: &[Curve3],
+    found: &[[Option<Aabb>; 2]],
+    tolerance: f64,
+) -> (Vec<Curve3>, Vec<[Option<Aabb>; 2]>) {
+    let size = [a, b]
+        .iter()
+        .filter_map(|body| super::bounds::body_bounds(body))
+        .map(|bounds| Vec3::from(bounds.min).distance(Vec3::from(bounds.max)))
+        .fold(tolerance, f64::max);
+    let fit = tolerance.max(size * 1e-4);
+    let carried = |body: &Body, curve: &Curve3| {
+        body.face_keys().any(|face| {
+            let node = body.faces.get(face);
+            let Some(surface) = node.and_then(|node| body.surfaces.get(node.surface)) else {
+                return false;
+            };
+            !matches!(surface, Surface::Plane(_))
+                && (0..=16).all(|step| {
+                    surface.distance_to(curve.point_at(step as f64 / 16.0)).abs() <= fit
+                })
+        })
+    };
+    let merge = |one: Option<Aabb>, other: Option<Aabb>| match (one, other) {
+        (Some(mut one), Some(other)) => {
+            one.merge(other);
+            Some(one)
+        }
+        _ => None,
+    };
+    let mut joined = Vec::new();
+    let mut boxes = Vec::new();
+    for i in 0..curves.len() {
+        for j in i + 1..curves.len() {
+            let (Curve3::Nurbs(one), Curve3::Nurbs(other)) = (&curves[i], &curves[j]) else {
+                continue;
+            };
+            let pair = crossing_join(one, other, fit, &[a, b]);
+            let Some(path) = pair.map(Curve3::Nurbs) else {
+                continue;
+            };
+            let empty = Some(Aabb::EMPTY);
+            for (side, body) in [(0, a), (1, b)] {
+                if !carried(body, &path) {
+                    continue;
+                }
+                // `found[..][1]` is where body b met it, which is what limits
+                // the cut of body a, and the other way round.
+                let other = merge(found[i][1 - side], found[j][1 - side]);
+                joined.push(path.clone());
+                boxes.push(if side == 0 { [empty, other] } else { [other, empty] });
+            }
+        }
+    }
+    (joined, boxes)
+}
+
+/// Two splines that cross — each running a little past the corner where
+/// the other ends — joined at the crossing: the longer piece of each, the
+/// first ending where the second starts. `None` where they do not come
+/// within `fit` of each other, or meet at an end of either.
+fn crossing_join(
+    one: &NurbsCurve3,
+    other: &NurbsCurve3,
+    fit: f64,
+    bodies: &[&Body; 2],
+) -> Option<NurbsCurve3> {
+    let (one_from, one_to) = one.domain();
+    let (other_from, other_to) = other.domain();
+    let at = |from: f64, to: f64, step: usize| from + (to - from) * step as f64 / 64.0;
+    let mut best = (f64::INFINITY, one_from, other_from);
+    for i in 0..=64 {
+        let u = at(one_from, one_to, i);
+        let point = Vec3::from(one.point_at_knot(u));
+        for k in 0..=64 {
+            let v = at(other_from, other_to, k);
+            let gap = point.distance(Vec3::from(other.point_at_knot(v)));
+            if gap < best.0 {
+                best = (gap, u, v);
+            }
+        }
+    }
+    let (_, mut u, mut v) = best;
+    for _ in 0..8 {
+        u = one.parameter_at(other.point_at_knot(v));
+        v = other.parameter_at(one.point_at_knot(u));
+    }
+    let gap = Vec3::from(one.point_at_knot(u)).distance(Vec3::from(other.point_at_knot(v)));
+    // The corner itself, where the other body's edge pierces the curved face
+    // both splines lie on: each spline stops a fit short of it, and joined
+    // between their ends the path kinks there.
+    let middle = (Vec3::from(one.point_at_knot(u)) + Vec3::from(other.point_at_knot(v))) * 0.5;
+    let corner = pierced_corner(bodies, middle, fit);
+    if let Some(corner) = corner {
+        u = one.parameter_at(corner.to_array());
+        v = other.parameter_at(corner.to_array());
+    }
+    let inner = |value: f64, from: f64, to: f64| {
+        let margin = (to - from) * 1e-6;
+        value > from + margin && value < to - margin
+    };
+    if gap > fit || !inner(u, one_from, one_to) || !inner(v, other_from, other_to) {
+        return None;
+    }
+    let length = |curve: &NurbsCurve3| {
+        let (from, to) = curve.domain();
+        (0..16)
+            .map(|step| {
+                Vec3::from(curve.point_at_knot(at(from, to, step * 4)))
+                    .distance(Vec3::from(curve.point_at_knot(at(from, to, step * 4 + 4))))
+            })
+            .sum::<f64>()
+    };
+    let (one_before, one_after) = one.split_at(u)?;
+    let (other_before, other_after) = other.split_at(v)?;
+    // Into the crossing along the one, out of it along the other.
+    let into = if length(&one_before) >= length(&one_after) {
+        one_before
+    } else {
+        one_after.reversed()?
+    };
+    let out = if length(&other_after) >= length(&other_before) {
+        other_after
+    } else {
+        other_before.reversed()?
+    };
+    into.joined_through(&out, corner.map(Vec3::to_array))
+}
+
+/// Where a straight edge of either body, passing within `fit` of `near`,
+/// pierces a curved face of the other near there: a corner of one body
+/// standing in a face of the other.
+fn pierced_corner(bodies: &[&Body; 2], near: Vec3, fit: f64) -> Option<Vec3> {
+    let mut best: Option<(f64, Vec3)> = None;
+    for (index, body) in bodies.iter().enumerate() {
+        let curved: Vec<&Surface> = bodies[1 - index]
+            .faces
+            .iter()
+            .filter_map(|(_, face)| bodies[1 - index].surfaces.get(face.surface))
+            .filter(|surface| !matches!(surface, Surface::Plane(_)))
+            .collect();
+        for (_, edge) in body.edges.iter() {
+            let Some(Curve3::Line(line)) = body.curves.get(edge.curve) else {
+                continue;
+            };
+            let origin = Vec3::from(line.origin);
+            let along = Vec3::from(line.direction);
+            let squared = along.length_squared();
+            if squared <= 0.0 {
+                continue;
+            }
+            let point = |t: f64| origin + along * t;
+            let start = (near - origin).dot(along) / squared;
+            if point(start).distance(near) > fit * 10.0 {
+                continue;
+            }
+            for surface in &curved {
+                // Secant steps on the signed distance along the line.
+                let step = fit / squared.sqrt();
+                let (mut t0, mut t1) = (start - step, start + step);
+                let mut f0 = surface.distance_to(point(t0).to_array());
+                let mut f1 = surface.distance_to(point(t1).to_array());
+                for _ in 0..32 {
+                    if (f1 - f0).abs() < 1e-300 {
+                        break;
+                    }
+                    let t2 = t1 - f1 * (t1 - t0) / (f1 - f0);
+                    (t0, f0) = (t1, f1);
+                    t1 = t2;
+                    f1 = surface.distance_to(point(t1).to_array());
+                    if f1.abs() <= 1e-12 * (1.0 + near.length()) {
+                        break;
+                    }
+                }
+                let hit = point(t1);
+                let gap = hit.distance(near);
+                let closer = best.is_none_or(|(seen, _)| gap < seen);
+                if f1.abs() <= fit * 1e-3 && gap <= fit * 10.0 && closer {
+                    best = Some((gap, hit));
+                }
+            }
+        }
+    }
+    best.map(|(_, corner)| corner)
 }
 
 /// A face whose one loop passes a corner twice, with no edge between the two
@@ -903,6 +1102,53 @@ fn align_corners(source: &Body, target: &mut Body, tolerance: f64, settled: bool
             if let Some((_, far)) = split_edge(target, key, parameter) {
                 boxes.push((far, edge_reach(target, far, tolerance)));
             }
+        }
+    }
+}
+
+/// A spline edge running past a corner of the other body, within the fit a
+/// traced spline is good to, is divided there: a cut joined across a corner
+/// of the other body — see [`chained_meetings`] — passes it as one edge,
+/// where the other body's faces meet it as two, and a result stitched from
+/// both needs the same corners on each side.
+fn split_splines_at_corners(source: &Body, target: &mut Body, reach: f64) {
+    for point in source.vertices.iter().map(|(_, vertex)| vertex.point).collect::<Vec<_>>() {
+        let keys: Vec<_> = target.edge_keys().collect();
+        for key in keys {
+            let Some(edge) = target.edges.get(key) else {
+                continue;
+            };
+            let Some(curve @ Curve3::Nurbs(_)) = target.curves.get(edge.curve) else {
+                continue;
+            };
+            let at_end = [edge.start, edge.end].iter().any(|corner| {
+                target.vertices.get(*corner).is_some_and(|corner| {
+                    Vec3::from(corner.point).distance(Vec3::from(point)) <= reach
+                })
+            });
+            let parameter = curve.parameter_at(point);
+            let on = Vec3::from(curve.point_at(parameter)).distance(Vec3::from(point)) <= reach;
+            if at_end || !on || edge.coedges.is_empty() {
+                continue;
+            }
+            let (low, high) = (
+                edge.start_parameter.min(edge.end_parameter),
+                edge.start_parameter.max(edge.end_parameter),
+            );
+            if parameter <= low || parameter >= high {
+                continue;
+            }
+            if let Some((near, _)) = split_edge(target, key, parameter) {
+                if let Some(corner) = target
+                    .edges
+                    .get(near)
+                    .map(|edge| edge.end)
+                    .and_then(|corner| target.vertices.get_mut(corner))
+                {
+                    corner.point = point;
+                }
+            }
+            break;
         }
     }
 }
@@ -1733,6 +1979,27 @@ fn same_surface(one: &Surface, other: &Surface, tolerance: f64) -> bool {
     match (one, other) {
         (Surface::Sphere(a), Surface::Sphere(b)) => {
             near(a.frame.origin, b.frame.origin) && (a.radius - b.radius).abs() <= tolerance
+        }
+        // The patches of a divided torus turn only their frames round the
+        // axis (see `make::torus_in_patches`).
+        (Surface::Torus(a), Surface::Torus(b)) => {
+            let axis = |torus: &super::geometry::Torus| torus.frame.normal().map(Vec3::from);
+            near(a.frame.origin, b.frame.origin)
+                && (a.major_radius - b.major_radius).abs() <= tolerance
+                && (a.minor_radius - b.minor_radius).abs() <= tolerance
+                && axis(a)
+                    .zip(axis(b))
+                    .is_some_and(|(one, other)| one.distance(other) <= tolerance)
+        }
+        // And so do the quarters of a divided cone.
+        (Surface::Cone(a), Surface::Cone(b)) => {
+            let axis = |cone: &super::geometry::Cone| cone.base.normal().map(Vec3::from);
+            near(a.base.origin, b.base.origin)
+                && (a.radius - b.radius).abs() <= tolerance
+                && (a.half_angle - b.half_angle).abs() <= 1e-12
+                && axis(a)
+                    .zip(axis(b))
+                    .is_some_and(|(one, other)| one.distance(other) <= tolerance)
         }
         _ => one == other,
     }

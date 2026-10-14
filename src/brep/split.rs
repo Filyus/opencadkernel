@@ -297,6 +297,28 @@ pub fn split_face(
             return None;
         }
     }
+    // A cut along a circle the face is already bounded by — the equator of a
+    // torus a plane runs through, met again on the next round — divides
+    // nothing: it hands back a lens between two arcs of that one circle.
+    // A disc cut from inside a face that had no edge on the circle is real.
+    let on_circle = |body: &Body, face: FaceKey| {
+        let coedges = body.face_coedges(face);
+        let on = |coedge: &CoedgeKey| {
+            body.coedges
+                .get(*coedge)
+                .and_then(|coedge| body.edges.get(coedge.edge))
+                .and_then(|edge| body.curves.get(edge.curve))
+                .is_some_and(|curve| same_circle(curve, cutter, tolerance))
+        };
+        (coedges.iter().any(on), !coedges.is_empty() && coedges.iter().all(on))
+    };
+    let lens = |face: FaceKey| on_circle(&candidate, face).1;
+    if result[0] != result[1]
+        && on_circle(body, face).0
+        && (lens(result[0]) || lens(result[1]))
+    {
+        return None;
+    }
     *body = candidate;
     Some(result)
 }
@@ -826,7 +848,10 @@ fn split_face_in_place(
         if !alignment.is_finite() || alignment == 0.0 {
             return None;
         }
-        let island_forward = (alignment > 0.0) == node.forward;
+        // A plane face whose loops wind against its normal — as some files
+        // write them — takes its island the way its loops actually run.
+        let winds_back = planar_area(body, face).is_some_and(|area| area < 0.0);
+        let island_forward = ((alignment > 0.0) == node.forward) != winds_back;
 
         // A cutter touching the boundary at one point — a fillet's circle
         // meeting the walls beside it — bounds no island: the face would

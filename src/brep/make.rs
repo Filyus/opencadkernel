@@ -718,6 +718,115 @@ pub(crate) fn sphere_in_octants(centre: [f64; 3], radius: f64) -> Option<Body> {
     body.validate().is_empty().then_some(body)
 }
 
+/// The same ring torus as [`torus`] in `frame`, divided into eight faces:
+/// four quarters round the ring, each split at the outer and inner equator.
+///
+/// A whole torus has one face closed both ways round, and a cut meeting both
+/// seams leaves pieces that wrap round its parameters and cannot be laid out
+/// flat. Here each face has its own frame, turned so the seam round the ring
+/// lies opposite it, and the seam round the tube is on its rim — the equator,
+/// which a drawing's ground plane most often cuts along anyway.
+pub(crate) fn torus_in_patches(
+    frame: Plane,
+    major_radius: f64,
+    minor_radius: f64,
+) -> Option<Body> {
+    if !(major_radius.is_finite() && minor_radius.is_finite())
+        || minor_radius <= 0.0
+        || major_radius <= minor_radius
+    {
+        return None;
+    }
+    let centre = Vec3::from(frame.origin);
+    let (x_axis, y_axis) = (Vec3::from(frame.x_axis), Vec3::from(frame.y_axis));
+    let normal = Vec3::from(frame.normal()?);
+    let direction = |angle: f64| x_axis * angle.cos() + y_axis * angle.sin();
+    let outer_radius = major_radius + minor_radius;
+    let inner_radius = major_radius - minor_radius;
+    let mut body = Body::new();
+    let outer: Vec<VertexKey> = (0..4)
+        .map(|k| {
+            let point = centre + direction(FRAC_PI_2 * k as f64) * outer_radius;
+            add_vertex(&mut body, point.to_array())
+        })
+        .collect();
+    let inner: Vec<VertexKey> = (0..4)
+        .map(|k| {
+            let point = centre + direction(FRAC_PI_2 * k as f64) * inner_radius;
+            add_vertex(&mut body, point.to_array())
+        })
+        .collect();
+    let arc = |body: &mut Body, curve, from: f64, to: f64, start, end| {
+        body.edges.insert(Edge {
+            curve,
+            start_parameter: from,
+            end_parameter: to,
+            start,
+            end,
+            coedges: Vec::new(),
+            provenance: Provenance::Synthesized,
+        })
+    };
+    // Round the ring at the outer and the inner equator, a quarter at a time.
+    let mut equators = [Vec::new(), Vec::new()];
+    for (index, (radius, corners)) in [(outer_radius, &outer), (inner_radius, &inner)]
+        .into_iter()
+        .enumerate()
+    {
+        let curve = body.curves.insert(Curve3::Circle(Circle3 { plane: frame, radius }));
+        for k in 0..4 {
+            let (from, to) = (FRAC_PI_2 * k as f64, FRAC_PI_2 * (k + 1) as f64);
+            let edge = arc(&mut body, curve, from, to, corners[k], corners[(k + 1) % 4]);
+            equators[index].push(edge);
+        }
+    }
+    // Round the tube at each quarter, from the outer equator over the top
+    // to the inner one, and on under it back.
+    let mut over = Vec::new();
+    let mut under = Vec::new();
+    for k in 0..4 {
+        let along = direction(FRAC_PI_2 * k as f64);
+        let plane = Plane::orthonormal(
+            (centre + along * major_radius).to_array(),
+            along.to_array(),
+            along.cross(normal).to_array(),
+        )?;
+        // `along.cross(normal)` makes the plane's y axis `normal` itself, so
+        // the tube circle climbs from the outer equator over the top.
+        let curve = body.curves.insert(Curve3::Circle(Circle3 { plane, radius: minor_radius }));
+        over.push(arc(&mut body, curve, 0.0, PI, outer[k], inner[k]));
+        under.push(arc(&mut body, curve, PI, TAU, inner[k], outer[k]));
+    }
+    let (lump, shell) = add_shell(&mut body);
+    for k in 0..4 {
+        let next = (k + 1) % 4;
+        let middle = direction(FRAC_PI_2 * k as f64 + FRAC_PI_2 * 0.5);
+        let own = Plane::orthonormal(centre.to_array(), (-middle).to_array(), normal.to_array())?;
+        let surface = body.surfaces.insert(Surface::Torus(Torus {
+            frame: own,
+            major_radius,
+            minor_radius,
+        }));
+        // Anticlockwise seen from outside: on top, out along the outer
+        // equator, over to the inner one and back; underneath, the reverse.
+        let top = [
+            (equators[0][k], true),
+            (over[next], true),
+            (equators[1][k], false),
+            (over[k], false),
+        ];
+        close_shell(&mut body, lump, shell, surface, true, &top)?;
+        let bottom = [
+            (equators[0][k], false),
+            (under[k], false),
+            (equators[1][k], true),
+            (under[next], true),
+        ];
+        close_shell(&mut body, lump, shell, surface, true, &bottom)?;
+    }
+    body.validate().is_empty().then_some(body)
+}
+
 /// A circular or elliptical cylinder standing on `base`.
 ///
 /// The two radii are the semi-axes of both planar end faces. Circular input
@@ -822,6 +931,131 @@ pub fn cone(base: [f64; 3], radius: f64, height: f64) -> Option<Body> {
         true,
         &[(rim, true), (seam, true), (seam, false)],
     )?;
+    body.validate().is_empty().then_some(body)
+}
+
+/// The same right cylinder as one standing on `base` with this `radius` and
+/// `height` along the frame's normal, its wall divided into four quarters
+/// with frames of their own, the seam opposite each (see
+/// [`torus_in_patches`]).
+pub(crate) fn cylinder_in_patches(base: Plane, radius: f64, height: f64) -> Option<Body> {
+    if !(radius.is_finite() && height.is_finite()) || radius <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let centre = Vec3::from(base.origin);
+    let (x_axis, y_axis) = (Vec3::from(base.x_axis), Vec3::from(base.y_axis));
+    let normal = Vec3::from(base.normal()?);
+    let lid = (centre + normal * height).to_array();
+    let top = Plane::orthonormal(lid, base.x_axis, normal.to_array())?;
+    let direction = |angle: f64| x_axis * angle.cos() + y_axis * angle.sin();
+    let mut body = Body::new();
+    let rim = |body: &mut Body, lift: f64| -> Vec<VertexKey> {
+        (0..4)
+            .map(|k| {
+                let point = centre + direction(FRAC_PI_2 * k as f64) * radius + normal * lift;
+                add_vertex(body, point.to_array())
+            })
+            .collect()
+    };
+    let (low, high) = (rim(&mut body, 0.0), rim(&mut body, height));
+    let arcs = |body: &mut Body, plane: Plane, ends: &[VertexKey]| -> Vec<EdgeKey> {
+        let circle = body.curves.insert(Curve3::Circle(Circle3 { plane, radius }));
+        (0..4)
+            .map(|k| {
+                body.edges.insert(Edge {
+                    curve: circle,
+                    start_parameter: FRAC_PI_2 * k as f64,
+                    end_parameter: FRAC_PI_2 * (k + 1) as f64,
+                    start: ends[k],
+                    end: ends[(k + 1) % 4],
+                    coedges: Vec::new(),
+                    provenance: Provenance::Synthesized,
+                })
+            })
+            .collect()
+    };
+    let (bottom, roof) = (arcs(&mut body, base, &low), arcs(&mut body, top, &high));
+    let lines: Vec<EdgeKey> =
+        (0..4).map(|k| add_line_edge(&mut body, low[k], high[k])).collect::<Option<_>>()?;
+    let (lump, shell) = add_shell(&mut body);
+    let floor = body.surfaces.insert(Surface::Plane(base));
+    let down: Vec<(EdgeKey, bool)> = (0..4).rev().map(|k| (bottom[k], false)).collect();
+    close_shell(&mut body, lump, shell, floor, false, &down)?;
+    let cap = body.surfaces.insert(Surface::Plane(top));
+    let up: Vec<(EdgeKey, bool)> = (0..4).map(|k| (roof[k], true)).collect();
+    close_shell(&mut body, lump, shell, cap, true, &up)?;
+    for k in 0..4 {
+        // Each quarter in its own frame, the seam half a turn away.
+        let middle = direction(FRAC_PI_2 * k as f64 + FRAC_PI_2 * 0.5);
+        let own = Plane::orthonormal(base.origin, (-middle).to_array(), normal.to_array())?;
+        let wall = body.surfaces.insert(Surface::Cylinder(Cylinder { base: own, radius }));
+        let quarter =
+            [(bottom[k], true), (lines[(k + 1) % 4], true), (roof[k], false), (lines[k], false)];
+        close_shell(&mut body, lump, shell, wall, true, &quarter)?;
+    }
+    body.validate().is_empty().then_some(body)
+}
+
+/// The same pointed cone as one standing on `base` with this `radius` and
+/// `height` along the frame's normal, its wall divided into four quarters
+/// with frames of their own, the seam opposite each (see
+/// [`torus_in_patches`]).
+pub(crate) fn cone_in_patches(base: Plane, radius: f64, height: f64) -> Option<Body> {
+    if !(radius.is_finite() && height.is_finite()) || radius <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let centre = Vec3::from(base.origin);
+    let (x_axis, y_axis) = (Vec3::from(base.x_axis), Vec3::from(base.y_axis));
+    let normal = Vec3::from(base.normal()?);
+    let direction = |angle: f64| x_axis * angle.cos() + y_axis * angle.sin();
+    let mut body = Body::new();
+    let apex = add_vertex(&mut body, (centre + normal * height).to_array());
+    let rim: Vec<VertexKey> = (0..4)
+        .map(|k| {
+            let point = centre + direction(FRAC_PI_2 * k as f64) * radius;
+            add_vertex(&mut body, point.to_array())
+        })
+        .collect();
+    let circle = body.curves.insert(Curve3::Circle(Circle3 { plane: base, radius }));
+    let arcs: Vec<EdgeKey> = (0..4)
+        .map(|k| {
+            body.edges.insert(Edge {
+                curve: circle,
+                start_parameter: FRAC_PI_2 * k as f64,
+                end_parameter: FRAC_PI_2 * (k + 1) as f64,
+                start: rim[k],
+                end: rim[(k + 1) % 4],
+                coedges: Vec::new(),
+                provenance: Provenance::Synthesized,
+            })
+        })
+        .collect();
+    let lines: Vec<EdgeKey> =
+        (0..4).map(|k| add_line_edge(&mut body, rim[k], apex)).collect::<Option<_>>()?;
+    let (lump, shell) = add_shell(&mut body);
+    let floor = body.surfaces.insert(Surface::Plane(base));
+    let down: Vec<(EdgeKey, bool)> = (0..4).rev().map(|k| (arcs[k], false)).collect();
+    close_shell(&mut body, lump, shell, floor, false, &down)?;
+    for k in 0..4 {
+        let middle = direction(FRAC_PI_2 * k as f64 + FRAC_PI_2 * 0.5);
+        let own = Plane::orthonormal(base.origin, (-middle).to_array(), normal.to_array())?;
+        let wall = body.surfaces.insert(Surface::Cone(Cone {
+            base: own,
+            radius,
+            half_angle: (radius / height).atan(),
+        }));
+        // In the quarter's own frame it spans a quarter turn either side of
+        // half a turn, rim to apex; the two generators meet at the apex,
+        // which the explicit curves name from either side.
+        let (from, to) = (PI - FRAC_PI_2 * 0.5, PI + FRAC_PI_2 * 0.5);
+        let line = |start: [f64; 2], end: [f64; 2]| Some(Curve2::Line(Line2 { start, end }));
+        let quarter = [
+            (arcs[k], true, line([from, 0.0], [to, 0.0])),
+            (lines[(k + 1) % 4], true, line([to, 0.0], [to, height])),
+            (lines[k], false, line([from, height], [from, 0.0])),
+        ];
+        close_shell_with_pcurves(&mut body, lump, shell, wall, true, &quarter)?;
+    }
     body.validate().is_empty().then_some(body)
 }
 

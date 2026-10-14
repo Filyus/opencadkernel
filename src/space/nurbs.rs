@@ -165,6 +165,87 @@ impl NurbsCurve3 {
         Some(reversed)
     }
 
+    /// The two pieces either side of knot parameter `at`, each clamped.
+    /// `None` for a closed curve or a parameter outside the open domain.
+    pub fn split_at(&self, at: f64) -> Option<(Self, Self)> {
+        let (from, to) = self.domain();
+        if self.closed || at <= from || at >= to {
+            return None;
+        }
+        let degree = self.degree;
+        let mut work = self.clone();
+        let count = |knots: &[f64]| knots.iter().filter(|knot| (*knot - at).abs() < 1e-12).count();
+        while count(&work.knots) < degree {
+            work.insert_knot(at);
+        }
+        let first = work.knots.iter().position(|knot| (*knot - at).abs() < 1e-12)?;
+        let mut left_knots = work.knots[..first].to_vec();
+        left_knots.extend(std::iter::repeat_n(at, degree + 1));
+        let mut right_knots = vec![at; degree + 1];
+        right_knots.extend_from_slice(&work.knots[first + degree..]);
+        let left = Self::new_strict(
+            degree,
+            work.control_points[..first].to_vec(),
+            left_knots,
+            work.weights[..first].to_vec(),
+        )?;
+        let right = Self::new_strict(
+            degree,
+            work.control_points[first - 1..].to_vec(),
+            right_knots,
+            work.weights[first - 1..].to_vec(),
+        )?;
+        Some((left, right))
+    }
+
+    /// This curve followed by `next`, which starts where this one ends: one
+    /// clamped curve, continuous in position at the join. `None` for curves
+    /// that are not open and clamped, or that do not meet.
+    pub fn joined(&self, next: &Self) -> Option<Self> {
+        self.joined_through(next, None)
+    }
+
+    /// [`joined`](Self::joined), the join put at `through` when given rather
+    /// than halfway between the two ends.
+    pub fn joined_through(&self, next: &Self, through: Option<[f64; 3]>) -> Option<Self> {
+        let (mut first, mut second) = (self.clone(), next.clone());
+        match first.degree.cmp(&second.degree) {
+            std::cmp::Ordering::Less => first = first.elevated(second.degree - first.degree)?,
+            std::cmp::Ordering::Greater => second = second.elevated(first.degree - second.degree)?,
+            std::cmp::Ordering::Equal => {}
+        }
+        let degree = first.degree;
+        let clamped = |curve: &Self| {
+            let (from, to) = curve.domain();
+            !curve.closed
+                && curve.knots[..=degree].iter().all(|knot| *knot == from)
+                && curve.knots[curve.knots.len() - degree - 1..].iter().all(|knot| *knot == to)
+        };
+        let (Some(&end), Some(&start)) =
+            (first.control_points.last(), second.control_points.first())
+        else {
+            return None;
+        };
+        if !clamped(&first) || !clamped(&second) {
+            return None;
+        }
+        let join =
+            through.unwrap_or_else(|| std::array::from_fn(|axis| 0.5 * (end[axis] + start[axis])));
+        let (_, at) = first.domain();
+        let (from, _) = second.domain();
+        // The second curve's weights are scaled to agree at the join; a
+        // rational curve is unchanged by a common factor.
+        let scale = first.weights.last()? / second.weights.first()?;
+        let mut control_points = first.control_points.clone();
+        *control_points.last_mut()? = join;
+        control_points.extend(second.control_points.iter().skip(1).copied());
+        let mut weights = first.weights.clone();
+        weights.extend(second.weights.iter().skip(1).map(|weight| weight * scale));
+        let mut knots = first.knots[..first.knots.len() - 1].to_vec();
+        knots.extend(second.knots[degree + 1..].iter().map(|knot| knot - from + at));
+        Self::new_strict(degree, control_points, knots, weights)
+    }
+
     /// The same curve written at a higher degree without changing its shape.
     pub fn elevated(&self, by: usize) -> Option<Self> {
         if by == 0 {

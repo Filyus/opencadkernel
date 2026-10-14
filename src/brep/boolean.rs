@@ -65,29 +65,69 @@ pub fn combine(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body,
         Some((super::transform(&a, &there)?, super::transform(&b, &there)?, centre))
     });
     let Some((a, b, centre)) = moved else {
-        return combine_retried(a, b, how, tolerance);
+        return combine_dividing(a, b, how, tolerance);
     };
-    let result = combine_retried(a, b, how, tolerance)?;
+    let result = combine_dividing(a, b, how, tolerance)?;
     super::transform(&result, &Placement::at(centre.to_array())).ok_or(Snag::CutRefused)
+}
+
+/// Which whole round bodies are divided into seamless patches before a
+/// Boolean (see `divided_torus`). A sphere always is.
+#[derive(Clone, Copy, PartialEq)]
+enum Divide {
+    Nothing,
+    TorusAndCone,
+    AlsoCylinder,
+}
+
+/// [`combine_retried`] with a whole torus or cone divided into seamless
+/// patches first, as it came where that does not give a result whose every
+/// face meshes, and with a cylinder divided too where neither does.
+fn combine_dividing(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
+    let meshes = |body: &Body| {
+        let mesh = super::mesh::tessellate(
+            body,
+            super::mesh::TessellationTolerance::new(crate::tessellation::DEFAULT_ANGLE, 1e-9),
+        );
+        mesh.missing_faces.is_empty() && !mesh.mesh.is_empty()
+    };
+    // The first result made stands where none meshes whole.
+    let mut first: Option<Result<Body, Snag>> = None;
+    for divide in [Divide::TorusAndCone, Divide::Nothing, Divide::AlsoCylinder] {
+        let result = combine_retried(a.clone(), b.clone(), how, tolerance, divide);
+        if result.as_ref().is_ok_and(|body| body.faces.is_empty() || meshes(body)) {
+            return result;
+        }
+        if first.as_ref().is_none_or(|first| first.is_err() && result.is_ok()) {
+            first = Some(result);
+        }
+    }
+    first.unwrap_or(Err(Snag::CutRefused))
 }
 
 /// [`combine_here`], tried once more with the tolerance opened up tenfold
 /// where it refuses: cuts landing a hair apart, a hair from a corner, read
 /// as one.
-fn combine_retried(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
-    combine_here(a.clone(), b.clone(), how, tolerance, false, false)
+fn combine_retried(
+    a: Body,
+    b: Body,
+    how: Operation,
+    tolerance: f64,
+    divide: Divide,
+) -> Result<Body, Snag> {
+    let here = |a: Body, b: Body, tolerance: f64, swapped: bool, reach: bool| {
+        combine_here(a, b, how, tolerance, swapped, reach, divide)
+    };
+    here(a.clone(), b.clone(), tolerance, false, false)
+        .or_else(|snag| here(a.clone(), b.clone(), tolerance, false, true).map_err(|_| snag))
         .or_else(|snag| {
-            combine_here(a.clone(), b.clone(), how, tolerance, false, true).map_err(|_| snag)
-        })
-        .or_else(|snag| {
-            combine_here(a.clone(), b.clone(), how, tolerance * 10.0, false, false)
-                .map_err(|_| snag)
+            here(a.clone(), b.clone(), tolerance * 10.0, false, false).map_err(|_| snag)
         })
         // The pair the other way round: the imprint cuts the second body
         // against the first's cuts, and the order can settle a corner. Taken
         // only where every face of it still meshes.
         .or_else(|snag| {
-            let Ok(result) = combine_here(b, a, how, tolerance, true, false) else {
+            let Ok(result) = here(b, a, tolerance, true, false) else {
                 return Err(snag);
             };
             let mesh = super::mesh::tessellate(
@@ -110,8 +150,21 @@ fn combine_here(
     tolerance: f64,
     swapped: bool,
     reach: bool,
+    divide: Divide,
 ) -> Result<Body, Snag> {
-    let (divided_a, divided_b) = (divided_sphere(&a, &b, tolerance), divided_sphere(&b, &a, tolerance));
+    let divided = |body: &Body, other: &Body| {
+        divided_sphere(body, other, tolerance)
+            .or_else(|| match divide {
+                Divide::Nothing => None,
+                _ => divided_torus(body, other, tolerance)
+                    .or_else(|| divided_cone(body, other, tolerance)),
+            })
+            .or_else(|| match divide {
+                Divide::AlsoCylinder => divided_cylinder(body, other, tolerance),
+                _ => None,
+            })
+    };
+    let (divided_a, divided_b) = (divided(&a, &b), divided(&b, &a));
     if let Some(divided) = divided_a {
         a = divided;
     }
@@ -166,7 +219,17 @@ fn combine_here(
                 continue;
             }
             match face_side(body, classifier, face, tolerance) {
-                Containment::OnBoundary => return Err(Snag::Coincident),
+                // A piece of a shared wall the imprint divided differently
+                // on the two bodies has no twin of its own, but it lies on
+                // a face of the other on the same surface: the normals
+                // settle it as they do a twin.
+                Containment::OnBoundary => {
+                    let wall = wall_under(body, face, other, tolerance).ok_or(Snag::Coincident)?;
+                    if keeps_shared_wall(body, face, other, wall, [flip, flip_other], first) {
+                        copy_face_with_tolerance(&mut result, body, face, shell, flip, tolerance)?;
+                        kept += 1;
+                    }
+                }
                 Containment::Unknown => return Err(Snag::CutRefused),
                 side if side == wanted => {
                     copy_face_with_tolerance(&mut result, body, face, shell, flip, tolerance)?;
@@ -401,21 +464,136 @@ fn divided_sphere(body: &Body, other: &Body, tolerance: f64) -> Option<Body> {
     let Surface::Sphere(sphere) = surface else {
         return None;
     };
-    let cut = other.face_keys().any(|key| {
+    meets(surface, other, tolerance)
+        .then(|| super::make::sphere_in_octants(sphere.frame.origin, sphere.radius))?
+}
+
+/// Whether any face of `other` meets `surface` along a curve. A meeting with
+/// no closed form is traced, and the trace needs the divided faces as much
+/// as a circle does.
+fn meets(surface: &Surface, other: &Body, tolerance: f64) -> bool {
+    other.face_keys().any(|key| {
         other
             .faces
             .get(key)
             .and_then(|face| other.surfaces.get(face.surface))
             .is_some_and(|wall| {
-                // A meeting with no closed form is traced, and the trace
-                // needs the divided faces as much as a circle does.
                 matches!(
                     super::intersect::surfaces(surface, wall, tolerance),
                     super::intersect::Meeting::Curves(_) | super::intersect::Meeting::Unknown
                 )
             })
+    })
+}
+
+/// [`divided_sphere`] for a whole ring torus: the same torus in patches
+/// with no seam inside any of them (see `make::torus_in_patches`).
+fn divided_torus(body: &Body, other: &Body, tolerance: f64) -> Option<Body> {
+    let mut faces = body.face_keys();
+    let face = body.faces.get(faces.next()?)?;
+    if faces.next().is_some() || !face.forward {
+        return None;
+    }
+    let surface = body.surfaces.get(face.surface)?;
+    let Surface::Torus(torus) = surface else {
+        return None;
+    };
+    meets(surface, other, tolerance).then(|| {
+        super::make::torus_in_patches(torus.frame, torus.major_radius, torus.minor_radius)
+    })?
+}
+
+/// [`divided_sphere`] for a whole right cylinder: its wall in quarters, no
+/// seam inside any (see `make::cylinder_in_patches`).
+fn divided_cylinder(body: &Body, other: &Body, tolerance: f64) -> Option<Body> {
+    if body.faces.len() != 3 {
+        return None;
+    }
+    let mut wall = None;
+    let mut caps = 0;
+    for key in body.face_keys() {
+        let face = body.faces.get(key)?;
+        match body.surfaces.get(face.surface)? {
+            Surface::Cylinder(cylinder) if face.forward => wall = Some((key, *cylinder)),
+            Surface::Plane(_) => {
+                let [ring] = face.loops[..] else { return None };
+                let [coedge] = body.loops.get(ring)?.coedges[..] else { return None };
+                let edge = body.edges.get(body.coedges.get(coedge)?.edge)?;
+                caps += matches!(body.curves.get(edge.curve), Some(Curve3::Circle(_))) as usize;
+            }
+            _ => return None,
+        }
+    }
+    let (face, cylinder) = wall?;
+    let normal = Vec3::from(cylinder.base.normal()?);
+    let origin = Vec3::from(cylinder.base.origin);
+    let heights = body
+        .vertices
+        .iter()
+        .map(|(_, vertex)| normal.dot(Vec3::from(vertex.point) - origin));
+    let (low, high) = heights.fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), along| {
+        (low.min(along), high.max(along))
     });
-    cut.then(|| super::make::sphere_in_octants(sphere.frame.origin, sphere.radius))?
+    if caps != 2 || !(high - low > tolerance) {
+        return None;
+    }
+    let surface = body.surfaces.get(body.faces.get(face)?.surface)?;
+    let base = super::super::space::Plane::orthonormal(
+        (origin + normal * low).to_array(),
+        cylinder.base.x_axis,
+        normal.to_array(),
+    )?;
+    meets(surface, other, tolerance)
+        .then(|| super::make::cylinder_in_patches(base, cylinder.radius, high - low))?
+}
+
+/// [`divided_sphere`] for a whole pointed cone on a flat base: the same cone
+/// with its wall in quarters, no seam inside any (see
+/// `make::cone_in_patches`).
+fn divided_cone(body: &Body, other: &Body, tolerance: f64) -> Option<Body> {
+    if body.faces.len() != 2 || body.vertices.len() != 2 {
+        return None;
+    }
+    let mut wall = None;
+    let mut rim = None;
+    for key in body.face_keys() {
+        let face = body.faces.get(key)?;
+        match body.surfaces.get(face.surface)? {
+            Surface::Cone(_) => wall = Some(key),
+            Surface::Plane(_) => {
+                let [ring] = face.loops[..] else { return None };
+                let [coedge] = body.loops.get(ring)?.coedges[..] else { return None };
+                let edge = body.edges.get(body.coedges.get(coedge)?.edge)?;
+                let Some(Curve3::Circle(circle)) = body.curves.get(edge.curve) else {
+                    return None;
+                };
+                rim = Some((*circle, edge.start));
+            }
+            _ => return None,
+        }
+    }
+    let (face, (circle, on_rim)) = (wall?, rim?);
+    let apex = body
+        .vertices
+        .iter()
+        .find(|(key, _)| *key != on_rim)
+        .map(|(_, vertex)| Vec3::from(vertex.point))?;
+    let centre = Vec3::from(circle.plane.origin);
+    let height = apex.distance(centre);
+    let towards = (apex - centre).normalize()?;
+    // Pointed: the apex lies on the axis, square over the rim's centre.
+    let normal = Vec3::from(circle.plane.normal()?);
+    if towards.cross(normal).length() > 1e-6 || height <= tolerance {
+        return None;
+    }
+    let surface = body.surfaces.get(body.faces.get(face)?.surface)?;
+    let base = super::super::space::Plane::orthonormal(
+        circle.plane.origin,
+        circle.plane.x_axis,
+        towards.to_array(),
+    )?;
+    meets(surface, other, tolerance)
+        .then(|| super::make::cone_in_patches(base, circle.radius, height))?
 }
 
 /// A Boolean initially sews all retained faces into one provisional shell.
@@ -629,6 +807,22 @@ fn same_surface(one: &Surface, other: &Surface, tolerance: f64) -> bool {
     parallel
         && one.distance_to(other_frame.origin).abs() <= tolerance
         && other.distance_to(one_frame.origin).abs() <= tolerance
+}
+
+/// The face of `other` on the same surface as `face` that `face`'s interior
+/// lies on, if any.
+fn wall_under(body: &Body, face: FaceKey, other: &Body, tolerance: f64) -> Option<FaceKey> {
+    let surface = body.surfaces.get(body.faces.get(face)?.surface)?;
+    let point = interior_point(body, face, tolerance)?;
+    other.face_keys().find(|candidate| {
+        other
+            .faces
+            .get(*candidate)
+            .and_then(|node| other.surfaces.get(node.surface))
+            .is_some_and(|theirs| same_surface(surface, theirs, tolerance))
+            && super::classify::face_distance(other, *candidate, point, tolerance)
+                .is_some_and(|gap| gap <= tolerance)
+    })
 }
 
 /// Whether this side's copy of a shared wall survives.

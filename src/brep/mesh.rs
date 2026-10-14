@@ -1977,6 +1977,7 @@ fn scheduled_face(
                 surface,
                 super::geometry::Surface::Cone(_) | super::geometry::Surface::Torus(_)
             )
+            && rim_runs_one_way(&band)
         {
             return fill_scheduled_singular_cap(body, face, &band, max_angle);
         }
@@ -2129,6 +2130,7 @@ fn chain_samples(
     let (first, pcurve) = pieces.next()?;
     let (mut points, mut explicit) = parameterize_samples(surface, &first, pcurve, tolerance)?;
     let mut all_explicit = explicit;
+    let mut shifted = [0.0; 2];
     unwrap_boundary(&mut points, surface_periods);
     let mut pieces = pieces.peekable();
     while let Some((samples, pcurve)) = pieces.next() {
@@ -2140,17 +2142,32 @@ fn chain_samples(
         // by one full period while meeting at an axis singularity; folding
         // that difference away erases the patch's parameter-space area.
         if !explicit || !next_explicit {
+            let raw = next.first()?.parameters;
             align_parameters(&mut next, &points, surface_periods, pieces.peek().is_none());
-        } else if let Some(shift) =
-            ordinary_period_jump(surface, points.last()?.parameters, next[0].parameters, surface_periods)
-        {
-            // Two explicit pcurves on either side of an ordinary seam point
-            // that merely name it from different turns: the jump is not a
-            // pole's, so it is folded rather than kept as a boundary segment
-            // spanning a whole period (#1538).
+            // Where an explicit run joins one placed by projection, the
+            // turn it was moved by carries on through the rest of the run.
+            let moved = next.first()?.parameters;
+            shifted = [moved[0] - raw[0], moved[1] - raw[1]];
+        } else {
             for point in &mut next {
-                point.parameters[0] += shift[0];
-                point.parameters[1] += shift[1];
+                point.parameters[0] += shifted[0];
+                point.parameters[1] += shifted[1];
+            }
+            if let Some(shift) = ordinary_period_jump(
+                surface,
+                points.last()?.parameters,
+                next[0].parameters,
+                surface_periods,
+            ) {
+                // Two explicit pcurves on either side of an ordinary seam
+                // point that merely name it from different turns: the jump
+                // is not a pole's, so it is folded rather than kept as a
+                // boundary segment spanning a whole period (#1538).
+                for point in &mut next {
+                    point.parameters[0] += shift[0];
+                    point.parameters[1] += shift[1];
+                }
+                shifted = [shifted[0] + shift[0], shifted[1] + shift[1]];
             }
         }
         if distance3(head, next[0].position) > join {
@@ -3249,17 +3266,23 @@ fn scheduled_singular_band(
         .map(|point| point.parameters[varying].abs())
         .fold(period.max(1.0), f64::max);
     let varying_epsilon = f64::EPSILON * 128.0 * varying_scale;
-    if rim.windows(2).any(|pair| {
+    let monotonic = !rim.windows(2).any(|pair| {
         let delta = pair[1].parameters[varying] - pair[0].parameters[varying];
         if increasing {
             delta < -varying_epsilon
         } else {
             delta > varying_epsilon
         }
-    }) {
-        return None;
+    });
+    // A rim that doubles back a little — a cut climbing the cone near
+    // upright — keeps its own order, turned to run with the parameter; the
+    // face is then filled as a ring through the apex rather than as a fan
+    // (see `scheduled_face`).
+    if monotonic {
+        rim.sort_by(|a, b| a.parameters[varying].total_cmp(&b.parameters[varying]));
+    } else if !increasing {
+        rim.reverse();
     }
-    rim.sort_by(|a, b| a.parameters[varying].total_cmp(&b.parameters[varying]));
     let base = rim.first()?.parameters[varying];
     let apex = cone.radius / cone.half_angle.tan();
     if !apex.is_finite()
@@ -4176,6 +4199,22 @@ fn subdivide_band_triangle(
 
 fn parameter_value_near(a: f64, b: f64) -> bool {
     (a - b).abs() <= f64::EPSILON * 128.0 * a.abs().max(b.abs()).max(1.0)
+}
+
+/// Whether the longer rim of a band never steps back along the varying
+/// parameter — what filling it column by column towards a singular rim needs.
+fn rim_runs_one_way(band: &BoundaryBand) -> bool {
+    let rim = if band.low.len() > band.high.len() { &band.low } else { &band.high };
+    let scale = rim
+        .iter()
+        .map(|point| point.parameters[band.varying].abs())
+        .fold(1.0, f64::max);
+    let epsilon = f64::EPSILON * 128.0 * scale;
+    let step = |pair: &[BoundaryPoint]| {
+        pair[1].parameters[band.varying] - pair[0].parameters[band.varying]
+    };
+    rim.windows(2).all(|pair| step(pair) >= -epsilon)
+        || rim.windows(2).all(|pair| step(pair) <= epsilon)
 }
 
 fn fill_scheduled_singular_cap(
