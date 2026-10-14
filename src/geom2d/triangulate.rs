@@ -9,8 +9,10 @@
 //! The method is the simple one: find a corner whose triangle contains no
 //! other vertex, cut it off, repeat. Candidate corners are selected by shape
 //! score before testing containment, so the first valid candidate is the
-//! preferred ear. Difficult rings can still require testing every candidate;
-//! the worst case remains cubic in the number of vertices.
+//! preferred ear. Candidates wait in a heap and the containment test only
+//! looks at points near the ear, so a ring with hundreds of bridged holes
+//! stays fast; a ring where most candidates are blocked can still need many
+//! tests per cut.
 //!
 //! Holes are joined to the outer ring by a bridge: a pair of coincident edges
 //! run out to the hole, round it, and back. The result is one ring with a
@@ -651,7 +653,218 @@ fn bridge_target(points: &mut Vec<Vec2>, ring: &mut Vec<usize>, from: Vec2) -> O
 }
 
 /// Cuts corners off until nothing is left.
-fn clip_ears(points: &[Vec2], mut ring: Vec<usize>) -> Vec<[usize; 3]> {
+/// Cuts ears until three corners remain.
+///
+/// The ear cut each round is the one with the smallest (shape score, ring
+/// position) among all corners that are ears, the score normalised by the
+/// bounds of the ring as it is at that moment. Finding it by rescanning the
+/// ring every round is cubic, which a hatch fill with a few hundred bridged
+/// holes (tens of thousands of corners) turns into minutes. The same choice
+/// is made here with three structures:
+///
+/// * a linked ring, so cutting a corner does not shift the rest;
+/// * a heap of convex corners by (score, position) with stale entries skipped
+///   — a cut only changes its two neighbours, and only a change of the ring's
+///   bounds rescales every score, which rebuilds the heap;
+/// * a grid of the ring's points, so the containment test of a candidate
+///   looks at the points near its triangle instead of all of them.
+///
+/// The predicate per candidate is unchanged, so the result is the same
+/// triangulation, triangle for triangle ([`clip_ears_reference`] in the tests).
+fn clip_ears(points: &[Vec2], ring: Vec<usize>) -> Vec<[usize; 3]> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let total = ring.len();
+    if total < 3 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(total - 2);
+    let mut previous: Vec<usize> = (0..total).map(|slot| (slot + total - 1) % total).collect();
+    let mut next: Vec<usize> = (0..total).map(|slot| (slot + 1) % total).collect();
+    let mut alive = vec![true; total];
+    let mut version = vec![0u32; total];
+    let mut remaining = total;
+    let point = |slot: usize| points[ring[slot]];
+
+    let bounds_of = |alive: &[bool]| {
+        let mut bounds = [[f64::INFINITY, f64::NEG_INFINITY]; 2];
+        for slot in (0..total).filter(|slot| alive[*slot]) {
+            let p = point(slot);
+            bounds[0][0] = bounds[0][0].min(p.x);
+            bounds[0][1] = bounds[0][1].max(p.x);
+            bounds[1][0] = bounds[1][0].min(p.y);
+            bounds[1][1] = bounds[1][1].max(p.y);
+        }
+        bounds
+    };
+    let scale_of = |bounds: [[f64; 2]; 2]| {
+        [
+            (bounds[0][1] - bounds[0][0]).max(f64::MIN_POSITIVE),
+            (bounds[1][1] - bounds[1][0]).max(f64::MIN_POSITIVE),
+        ]
+    };
+    let mut bounds = bounds_of(&alive);
+    let mut scale = scale_of(bounds);
+
+    // Uniform grid over the initial bounds; points never move, cut ones are skipped.
+    let side = (total as f64).sqrt().ceil().max(1.0) as usize;
+    let origin = [bounds[0][0], bounds[1][0]];
+    let extent = [
+        (bounds[0][1] - bounds[0][0]).max(f64::MIN_POSITIVE),
+        (bounds[1][1] - bounds[1][0]).max(f64::MIN_POSITIVE),
+    ];
+    let cell_of = |value: f64, axis: usize| -> usize {
+        let at = ((value - origin[axis]) / extent[axis] * side as f64).floor();
+        if at.is_nan() || at < 0.0 {
+            0
+        } else {
+            (at as usize).min(side - 1)
+        }
+    };
+    let mut grid: Vec<Vec<usize>> = vec![Vec::new(); side * side];
+    for slot in 0..total {
+        let p = point(slot);
+        grid[cell_of(p.y, 1) * side + cell_of(p.x, 0)].push(slot);
+    }
+
+    #[derive(PartialEq)]
+    struct Entry {
+        score: f64,
+        slot: usize,
+        version: u32,
+    }
+    impl Eq for Entry {}
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Entry {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.score
+                .total_cmp(&other.score)
+                .then_with(|| self.slot.cmp(&other.slot))
+        }
+    }
+
+    let corners = |slot: usize, previous: &[usize], next: &[usize]| {
+        [point(previous[slot]), point(slot), point(next[slot])]
+    };
+    let score_of = |[a, b, c]: [Vec2; 3], scale: [f64; 2]| {
+        let corners = [a, b, c];
+        (0..3)
+            .map(|index| {
+                let following = (index + 1) % 3;
+                let dx = (corners[following].x - corners[index].x) / scale[0];
+                let dy = (corners[following].y - corners[index].y) / scale[1];
+                dx * dx + dy * dy
+            })
+            .fold(0.0, f64::max)
+    };
+
+    let mut heap: BinaryHeap<Reverse<Entry>> = BinaryHeap::new();
+    let fill = |heap: &mut BinaryHeap<Reverse<Entry>>,
+                alive: &[bool],
+                version: &[u32],
+                previous: &[usize],
+                next: &[usize],
+                scale: [f64; 2]| {
+        heap.clear();
+        for slot in (0..total).filter(|slot| alive[*slot]) {
+            let shape = corners(slot, previous, next);
+            if convex_corner(shape) {
+                heap.push(Reverse(Entry {
+                    score: score_of(shape, scale),
+                    slot,
+                    version: version[slot],
+                }));
+            }
+        }
+    };
+    fill(&mut heap, &alive, &version, &previous, &next, scale);
+
+    let mut deferred = Vec::new();
+    while remaining > 3 {
+        let mut cut = None;
+        while let Some(Reverse(entry)) = heap.pop() {
+            if !alive[entry.slot] || entry.version != version[entry.slot] {
+                continue;
+            }
+            let [a, b, c] = corners(entry.slot, &previous, &next);
+            let (before, after) = (previous[entry.slot], next[entry.slot]);
+            let reach = 1e-9 * (extent[0] + extent[1]);
+            let (low_x, high_x) = (a.x.min(b.x).min(c.x) - reach, a.x.max(b.x).max(c.x) + reach);
+            let (low_y, high_y) = (a.y.min(b.y).min(c.y) - reach, a.y.max(b.y).max(c.y) + reach);
+            let blocked = (cell_of(low_y, 1)..=cell_of(high_y, 1)).any(|row| {
+                (cell_of(low_x, 0)..=cell_of(high_x, 0)).any(|column| {
+                    grid[row * side + column].iter().any(|&other| {
+                        if !alive[other] || other == entry.slot || other == before || other == after
+                        {
+                            return false;
+                        }
+                        let p = point(other);
+                        p != a && p != b && p != c && inside(a, b, c, p)
+                    })
+                })
+            });
+            if blocked {
+                deferred.push(entry);
+            } else {
+                cut = Some(entry.slot);
+                break;
+            }
+        }
+        // No ear anywhere: the ring crosses itself and there is no
+        // triangulation to find.
+        let Some(at) = cut else {
+            return Vec::new();
+        };
+        let (before, after) = (previous[at], next[at]);
+        out.push([ring[before], ring[at], ring[after]]);
+        alive[at] = false;
+        remaining -= 1;
+        next[before] = after;
+        previous[after] = before;
+        version[before] += 1;
+        version[after] += 1;
+        let gone = point(at);
+        if gone.x == bounds[0][0]
+            || gone.x == bounds[0][1]
+            || gone.y == bounds[1][0]
+            || gone.y == bounds[1][1]
+        {
+            bounds = bounds_of(&alive);
+            let rescaled = scale_of(bounds);
+            if rescaled != scale {
+                scale = rescaled;
+                deferred.clear();
+                fill(&mut heap, &alive, &version, &previous, &next, scale);
+                continue;
+            }
+        }
+        heap.extend(deferred.drain(..).map(Reverse));
+        for slot in [before, after] {
+            let shape = corners(slot, &previous, &next);
+            if convex_corner(shape) {
+                heap.push(Reverse(Entry {
+                    score: score_of(shape, scale),
+                    slot,
+                    version: version[slot],
+                }));
+            }
+        }
+    }
+    let last: Vec<usize> = (0..total).filter(|slot| alive[*slot]).collect();
+    if last.len() == 3 {
+        out.push([ring[last[0]], ring[last[1]], ring[last[2]]]);
+    }
+    out
+}
+
+/// The original selection loop, kept as the oracle for [`clip_ears`].
+#[cfg(test)]
+fn clip_ears_reference(points: &[Vec2], mut ring: Vec<usize>) -> Vec<[usize; 3]> {
     let mut out = Vec::with_capacity(ring.len().saturating_sub(2));
     let mut candidates = Vec::new();
     // Every ear removes one vertex, so the loop cannot run longer than the
@@ -808,6 +1021,146 @@ mod tests {
 
     fn square(size: f64) -> Vec<[f64; 2]> {
         vec![[0.0, 0.0], [size, 0.0], [size, size], [0.0, size]]
+    }
+
+    /// Bridged ring for an outer ring and holes, as `polygon` builds it.
+    fn bridged(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> (Vec<Vec2>, Vec<usize>) {
+        let mut points: Vec<Vec2> = orient(outer, true);
+        let mut ring: Vec<usize> = (0..points.len()).collect();
+        let mut pending: Vec<Vec<Vec2>> = holes
+            .iter()
+            .map(|hole| orient(hole, false))
+            .filter(|hole| hole.len() >= 3)
+            .collect();
+        pending.sort_by(|a, b| rightmost(b).1.x.total_cmp(&rightmost(a).1.x));
+        for hole in pending {
+            bridge(&mut points, &mut ring, hole);
+        }
+        (points, ring)
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    fn star(
+        random: &mut Lcg,
+        centre: [f64; 2],
+        radius: f64,
+        corners: usize,
+        jitter: f64,
+    ) -> Vec<[f64; 2]> {
+        (0..corners)
+            .map(|index| {
+                let angle = index as f64 / corners as f64 * std::f64::consts::TAU;
+                let r = radius * (1.0 - jitter * random.next());
+                [centre[0] + r * angle.cos(), centre[1] + r * angle.sin()]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn faster_ear_clipping_cuts_the_same_ears_as_the_reference() {
+        let mut random = Lcg(7);
+        for case in 0..60 {
+            let corners = 12 + case * 7;
+            let outer = star(
+                &mut random,
+                [0.0, 0.0],
+                100.0,
+                corners,
+                if case % 3 == 0 { 0.0 } else { 0.5 },
+            );
+            let mut holes = Vec::new();
+            let per_side = case % 6;
+            for row in 0..per_side {
+                for column in 0..per_side {
+                    let span = 80.0 / per_side.max(1) as f64;
+                    let centre = [
+                        -40.0 + span * (column as f64 + 0.5),
+                        -40.0 + span * (row as f64 + 0.5),
+                    ];
+                    // Aligned holes on even cases, jittered ones on odd cases.
+                    let shift = if case % 2 == 0 {
+                        0.0
+                    } else {
+                        (random.next() - 0.5) * span * 0.2
+                    };
+                    holes.push(star(
+                        &mut random,
+                        [centre[0] + shift, centre[1]],
+                        span * 0.3,
+                        5 + (row + column) % 7,
+                        0.4,
+                    ));
+                }
+            }
+            let (points, ring) = bridged(&outer, &holes);
+            assert_eq!(
+                clip_ears(&points, ring.clone()),
+                clip_ears_reference(&points, ring),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn faster_ear_clipping_matches_the_reference_on_ties_and_slivers() {
+        // Equal scores everywhere (regular grid ring) and a nearly degenerate sliver.
+        let grid: Vec<[f64; 2]> = (0..10)
+            .map(|x| [x as f64, 0.0])
+            .chain((0..10).map(|y| [9.0, y as f64]))
+            .chain((0..10).map(|x| [9.0 - x as f64, 9.0]))
+            .chain((0..10).map(|y| [0.0, 9.0 - y as f64]))
+            .collect();
+        let sliver = vec![
+            [0.0, 0.0],
+            [1000.0, 0.0],
+            [1000.0, 1e-6],
+            [500.0, 2e-6],
+            [0.0, 1e-6],
+        ];
+        for outer in [grid, sliver] {
+            let (points, ring) = bridged(&outer, &[]);
+            assert_eq!(
+                clip_ears(&points, ring.clone()),
+                clip_ears_reference(&points, ring)
+            );
+        }
+    }
+
+    #[test]
+    fn hundreds_of_holes_are_filled_without_blowing_up() {
+        // A hatch fill with a few hundred bridged holes used to take minutes.
+        let mut random = Lcg(11);
+        let outer = star(&mut random, [0.0, 0.0], 1000.0, 2000, 0.02);
+        let mut holes = Vec::new();
+        for row in 0..18 {
+            for column in 0..18 {
+                let centre = [-600.0 + 70.0 * column as f64, -600.0 + 70.0 * row as f64];
+                holes.push(star(&mut random, centre, 20.0, 24, 0.3));
+            }
+        }
+        let start = std::time::Instant::now();
+        let (points, triangles) = polygon(&outer, &holes);
+        let expected = signed_area_arrays(&outer).abs()
+            - holes
+                .iter()
+                .map(|hole| signed_area_arrays(hole).abs())
+                .sum::<f64>();
+        assert!(triangulation_matches(&points, &triangles, expected));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
