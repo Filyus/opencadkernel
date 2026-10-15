@@ -217,7 +217,7 @@ impl Bounds {
 
 /// Splits every segment at every crossing, so afterwards they meet only end
 /// to end.
-fn split_at_crossings(segments: &[Line], tolerance: f64) -> Vec<Line> {
+pub(super) fn split_at_crossings(segments: &[Line], tolerance: f64) -> Vec<Line> {
     let bounds: Vec<Bounds> = segments.iter().copied().map(Bounds::of).collect();
     let vertical = sweep_on_y(&bounds, tolerance);
     let key = |b: &Bounds| if vertical { b.min.y } else { b.min.x };

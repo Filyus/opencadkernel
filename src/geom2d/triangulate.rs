@@ -256,12 +256,90 @@ pub fn rings(input: &[Vec<[f64; 2]>]) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
                 [triangle[0] + base, triangle[1] + base, triangle[2] + base]
             }));
         }
+        // Holes whose boundaries touch or overlap (a column against a beam)
+        // defeat the polygon triangulator, and the whole component used to
+        // be dropped. Fill it by the even-odd rule directly instead.
+        if !complete {
+            let rings: Vec<&[[f64; 2]]> =
+                members.iter().map(|index| valid[*index].points.as_slice()).collect();
+            (component_points, component_triangles) = even_odd_slabs(&rings);
+            complete = !component_triangles.is_empty();
+        }
         if complete {
             let base = points.len();
             points.extend(component_points);
             triangles.extend(component_triangles.into_iter().map(|triangle| {
                 [triangle[0] + base, triangle[1] + base, triangle[2] + base]
             }));
+        }
+    }
+    (points, triangles)
+}
+
+/// Even-odd fill of rings whose boundaries may touch or overlap: vertical
+/// slabs between every vertex and crossing, each cut into trapezoids
+/// between alternate edges. Shared edges count twice and so cancel.
+// ponytail: one slab per distinct x, so a curved boundary with thousands of
+// vertices makes thousands of thin slabs; only used when the polygon
+// triangulator gave up on a component.
+fn even_odd_slabs(rings: &[&[[f64; 2]]]) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
+    let segments: Vec<super::curve::Line> = rings
+        .iter()
+        .flat_map(|ring| {
+            (0..ring.len()).map(move |i| super::curve::Line {
+                start: ring[i],
+                end: ring[(i + 1) % ring.len()],
+            })
+        })
+        .collect();
+    let extent = rings
+        .iter()
+        .flat_map(|ring| ring.iter())
+        .flatten()
+        .fold(0.0_f64, |extent, value| extent.max(value.abs()))
+        .max(1.0);
+    let tolerance = extent * 1e-12;
+    let mut edges: Vec<([f64; 2], [f64; 2])> =
+        super::arrangement::split_at_crossings(&segments, tolerance)
+            .into_iter()
+            .filter(|line| (line.end[0] - line.start[0]).abs() > tolerance)
+            .map(|line| {
+                if line.start[0] < line.end[0] {
+                    (line.start, line.end)
+                } else {
+                    (line.end, line.start)
+                }
+            })
+            .collect();
+    edges.sort_by(|a, b| a.0[0].total_cmp(&b.0[0]));
+    let mut xs: Vec<f64> = edges.iter().flat_map(|(a, b)| [a[0], b[0]]).collect();
+    xs.sort_by(f64::total_cmp);
+    xs.dedup_by(|a, b| (*a - *b).abs() <= tolerance);
+    let y_at = |(a, b): ([f64; 2], [f64; 2]), x: f64| a[1] + (x - a[0]) * (b[1] - a[1]) / (b[0] - a[0]);
+
+    let mut points = Vec::new();
+    let mut triangles = Vec::new();
+    let mut active: Vec<usize> = Vec::new();
+    let mut next = 0;
+    for slab in xs.windows(2) {
+        let (x0, x1) = (slab[0], slab[1]);
+        while next < edges.len() && edges[next].0[0] <= x0 + tolerance {
+            active.push(next);
+            next += 1;
+        }
+        active.retain(|edge| edges[*edge].1[0] >= x1 - tolerance);
+        let mut spans: Vec<(f64, f64)> =
+            active.iter().map(|edge| (y_at(edges[*edge], x0), y_at(edges[*edge], x1))).collect();
+        spans.sort_by(|a, b| (a.0 + a.1).total_cmp(&(b.0 + b.1)));
+        for pair in spans.chunks_exact(2) {
+            let ((b0, b1), (t0, t1)) = (pair[0], pair[1]);
+            if (t0 - b0).abs() <= tolerance && (t1 - b1).abs() <= tolerance {
+                continue;
+            }
+            let base = points.len();
+            points.extend([[x0, b0], [x1, b1], [x1, t1], [x0, t0]]);
+            triangles.push([base, base + 1, base + 2]);
+            triangles.push([base, base + 2, base + 3]);
         }
     }
     (points, triangles)
