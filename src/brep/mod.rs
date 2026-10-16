@@ -51,6 +51,7 @@ pub(crate) mod nurbs_builder;
 pub mod pcurve;
 pub mod place;
 pub mod presspull;
+pub mod recognize;
 pub mod slice;
 pub mod shell;
 pub mod split;
@@ -71,6 +72,7 @@ pub use loft::loft;
 pub use loft_general::{loft_with_options, LoftError, LoftOptions, LoftSection};
 pub use mass::{analytic_mass_properties, mass_properties, MassProperties};
 pub use mesh::{body as mesh_body, Mesh};
+pub use recognize::{analytic_curve, analytic_surface};
 pub use place::{edge_points, edge_polylines, transform, Placement};
 pub use presspull::{
     extrusion_profile_pieces, intersect_planar_regions, planar_face_at_point, planar_face_profile,
