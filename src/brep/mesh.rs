@@ -1292,6 +1292,7 @@ fn face_isolines(
                 bounds[fixed_axis][0] + fixed_span * (index as f64 + 1.0) / (count as f64 + 1.0);
             for interval in line_intervals(&parameters, fixed_axis, fixed) {
                 let mut points = Vec::new();
+                let mut budget = PCURVE_REFINE_BUDGET;
                 if !sample_isoline(
                     surface,
                     fixed_axis,
@@ -1301,6 +1302,7 @@ fn face_isolines(
                     max_angle,
                     0,
                     &mut points,
+                    &mut budget,
                 ) {
                     return None;
                 }
@@ -1399,7 +1401,12 @@ fn sample_isoline(
     max_angle: f64,
     depth: u32,
     points: &mut Vec<[f64; 3]>,
+    budget: &mut usize,
 ) -> bool {
+    let Some(left) = budget.checked_sub(1) else {
+        return false;
+    };
+    *budget = left;
     let at = |value: f64| {
         let mut parameters = [0.0; 2];
         parameters[fixed_axis] = fixed;
@@ -1439,6 +1446,7 @@ fn sample_isoline(
             max_angle,
             depth + 1,
             points,
+            budget,
         ) || !sample_isoline(
             surface,
             fixed_axis,
@@ -1448,6 +1456,7 @@ fn sample_isoline(
             max_angle,
             depth + 1,
             points,
+            budget,
         ) {
             return false;
         }
@@ -1579,6 +1588,7 @@ fn shared_edge_samples(
         parameter: edge.start_parameter,
         position: body.vertices.get(edge.start)?.point,
     }];
+    let mut budget = PCURVE_REFINE_BUDGET;
     if refine_edge(
         body,
         edge_key,
@@ -1589,6 +1599,7 @@ fn shared_edge_samples(
         0,
         &mut samples,
         &directions,
+        &mut budget,
     )
     .is_some()
     {
@@ -1840,7 +1851,9 @@ fn refine_edge(
     depth: u32,
     samples: &mut Vec<super::place::EdgeSample>,
     coedge_directions: &HashMap<super::topology::CoedgeKey, bool>,
+    budget: &mut usize,
 ) -> Option<()> {
+    *budget = budget.checked_sub(1)?;
     let edge = body.edges.get(edge_key)?;
     let curve = body.curves.get(edge.curve)?;
     let middle = 0.5 * (from + to);
@@ -1915,6 +1928,7 @@ fn refine_edge(
             depth + 1,
             samples,
             coedge_directions,
+            budget,
         )?;
         samples.push(super::place::EdgeSample {
             parameter: middle,
@@ -1930,6 +1944,7 @@ fn refine_edge(
             depth + 1,
             samples,
             coedge_directions,
+            budget,
         )?;
     }
     Some(())
@@ -3490,6 +3505,7 @@ fn parameter_seam(
     let fixed = 0.5 * (from.parameters[fixed_axis] + to.parameters[fixed_axis]);
     let varying_axis = 1 - fixed_axis;
     let mut points = Vec::new();
+    let mut budget = PCURVE_REFINE_BUDGET;
     if !sample_parameter_seam(
         surface,
         fixed_axis,
@@ -3499,6 +3515,7 @@ fn parameter_seam(
         max_angle,
         0,
         &mut points,
+        &mut budget,
     ) {
         return None;
     }
@@ -3529,7 +3546,12 @@ fn sample_parameter_seam(
     max_angle: f64,
     depth: u32,
     points: &mut Vec<BoundaryPoint>,
+    budget: &mut usize,
 ) -> bool {
+    let Some(left) = budget.checked_sub(1) else {
+        return false;
+    };
+    *budget = left;
     let parameters = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0].map(|unit| {
         let mut parameters = [0.0; 2];
         parameters[fixed_axis] = fixed;
@@ -3553,6 +3575,7 @@ fn sample_parameter_seam(
             max_angle,
             depth + 1,
             points,
+            budget,
         ) && sample_parameter_seam(
             surface,
             fixed_axis,
@@ -3562,6 +3585,7 @@ fn sample_parameter_seam(
             max_angle,
             depth + 1,
             points,
+            budget,
         );
     }
     let mut parameters = [0.0; 2];
@@ -3857,7 +3881,11 @@ fn distance3(a: [f64; 3], b: [f64; 3]) -> f64 {
 
 /// Recursion guard; tolerance normally stops first.
 const MAX_DEPTH: u32 = 32;
-/// Most pieces one edge's pcurve walk may split into before it is abandoned.
+/// Most pieces one edge or parameter line may split into before its walk is
+/// abandoned. Every walk splits both halves of a span that still turns too
+/// far, so a span whose angle never settles (one that measures NaN, say)
+/// would otherwise split until the depth cap: 2^32 calls, or 2^50 once the
+/// floating-point spacing runs out under the face cap.
 const PCURVE_REFINE_BUDGET: usize = 1 << 14;
 const MAX_FACE_DEPTH: u32 = 128;
 const MAX_FACE_PASSES: usize = 128;
@@ -3954,6 +3982,7 @@ fn fill_scheduled_band(
                 .map(|pair| 0.5 * (pair[0] + pair[1])),
         );
         let mut values = Vec::new();
+        let mut budget = MAX_FACE_ADDITIONS;
         for varying in probes {
             surface_span_breaks(
                 surface,
@@ -3964,6 +3993,7 @@ fn fill_scheduled_band(
                 max_angle,
                 0,
                 &mut values,
+                &mut budget,
             )?;
         }
         values.push(fixed_to);
@@ -4047,7 +4077,9 @@ fn surface_span_breaks(
     max_angle: f64,
     depth: u32,
     values: &mut Vec<f64>,
+    budget: &mut usize,
 ) -> Option<()> {
+    *budget = budget.checked_sub(1)?;
     let parameters = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0].map(|unit| {
         let mut parameters = [0.0; 2];
         parameters[fixed_axis] = from + (to - from) * unit;
@@ -4074,6 +4106,7 @@ fn surface_span_breaks(
         max_angle,
         depth + 1,
         values,
+        budget,
     )?;
     surface_span_breaks(
         surface,
@@ -4084,6 +4117,7 @@ fn surface_span_breaks(
         max_angle,
         depth + 1,
         values,
+        budget,
     )
 }
 
@@ -4095,7 +4129,9 @@ fn surface_span_depth(
     to: f64,
     max_angle: f64,
     depth: u32,
+    budget: &mut usize,
 ) -> Option<u32> {
+    *budget = budget.checked_sub(1)?;
     let parameters = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0].map(|unit| {
         let mut parameters = [0.0; 2];
         parameters[fixed_axis] = from + (to - from) * unit;
@@ -4118,6 +4154,7 @@ fn surface_span_depth(
             middle,
             max_angle,
             depth + 1,
+            budget,
         )?
         .max(surface_span_depth(
             surface,
@@ -4127,6 +4164,7 @@ fn surface_span_depth(
             to,
             max_angle,
             depth + 1,
+            budget,
         )?),
     )
 }
@@ -4231,6 +4269,7 @@ fn fill_scheduled_singular_cap(
     let apex = singular.first()?;
     let fixed = 1 - band.varying;
     let surface = body.surfaces.get(body.faces.get(face)?.surface)?;
+    let mut budget = MAX_FACE_ADDITIONS;
     let mut radial_depth = rim.iter().try_fold(0, |depth, point| {
         Some(depth.max(surface_span_depth(
             surface,
@@ -4240,6 +4279,7 @@ fn fill_scheduled_singular_cap(
             point.parameters[fixed],
             max_angle,
             0,
+            &mut budget,
         )?))
     })?;
     let triangles = loop {
@@ -4600,6 +4640,7 @@ fn surface_grid_values(
             }
             _ => max_angle * FRAC_1_SQRT_2,
         };
+        let mut budget = MAX_FACE_ADDITIONS;
         for probe in probes {
             surface_span_breaks(
                 surface,
@@ -4610,6 +4651,7 @@ fn surface_grid_values(
                 axis_angle,
                 0,
                 &mut values,
+                &mut budget,
             )?;
         }
         if let Some(nurbs) = nurbs {
