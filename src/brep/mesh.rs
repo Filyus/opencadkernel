@@ -3811,7 +3811,41 @@ fn whole_surface_domain(
                     matching.len() == 2 && matching[0].forward != matching[1].forward
                 })
         });
-    if !node.loops.is_empty() && !seam_loop {
+    // A torus cut once round by one of its own circles (a closed edge along
+    // a constant u or v) is not divided: the face is the whole torus.
+    let cut_once = matches!(surface, super::geometry::Surface::Torus(_))
+        && node.loops.len() == 1
+        && body.loops.get(node.loops[0]).is_some_and(|ring| {
+            let [coedge_key] = ring.coedges.as_slice() else {
+                return false;
+            };
+            let Some(edge) = body.coedges.get(*coedge_key).and_then(|c| body.edges.get(c.edge)) else {
+                return false;
+            };
+            let Some(curve) = body.curves.get(edge.curve) else {
+                return false;
+            };
+            if edge.start != edge.end {
+                return false;
+            }
+            let (t0, t1) = (edge.start_parameter, edge.end_parameter);
+            let params: Option<Vec<(f64, f64)>> = (0..16)
+                .map(|k| surface.parameters_at(curve.point_at(t0 + (t1 - t0) * k as f64 / 16.0)))
+                .collect();
+            let Some(params) = params else {
+                return false;
+            };
+            let tau = std::f64::consts::TAU;
+            let steady = |pick: fn(&(f64, f64)) -> f64| {
+                let first = pick(&params[0]);
+                params.iter().all(|p| {
+                    let d = (pick(p) - first).rem_euclid(tau);
+                    d.min(tau - d) < 1e-6
+                })
+            };
+            steady(|p| p.0) || steady(|p| p.1)
+        });
+    if !node.loops.is_empty() && !seam_loop && !cut_once {
         return None;
     }
     let closed = match surface {
