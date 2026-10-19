@@ -983,11 +983,13 @@ fn nurbs_surface(spline: SatBSplineSurface) -> Option<NurbsSurface3> {
     )
 }
 
-/// An offset surface saved without its fitted spline: points pushed
-/// `distance` along the base's normal on a grid, interpolated row by row and
-/// then column by column. Evenly spaced samples interpolated at even
-/// parameters keep the base's `(u, v)`, so the face's pcurves still apply.
-fn offset_surface(base: &NurbsSurface3, distance: f64) -> Option<NurbsSurface3> {
+/// A spline standing for the offset of `base` (an offset surface saved
+/// without its fitted spline, or one another format gives only as a base and
+/// a distance): points pushed `distance` along the base's normal on a grid,
+/// interpolated row by row and then column by column. Evenly spaced samples
+/// interpolated at even parameters keep the base's `(u, v)`, so the face's
+/// pcurves still apply.
+pub fn offset_surface(base: &NurbsSurface3, distance: f64) -> Option<NurbsSurface3> {
     let ((u0, u1), (v0, v1)) = base.domain();
     let rows = base.control_points();
     let (u_count, v_count) = ((rows.len() * 4).max(16), (rows.first()?.len() * 4).max(4));
