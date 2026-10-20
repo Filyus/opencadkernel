@@ -4249,6 +4249,7 @@ mod tests {
                 Some(Surface::Sphere(_)) => "sphere",
                 Some(Surface::Torus(_)) => "torus",
                 Some(Surface::Nurbs(_)) => "nurbs",
+                Some(Surface::Offset(_)) => "offset",
                 None => "missing",
             })
             .collect();
