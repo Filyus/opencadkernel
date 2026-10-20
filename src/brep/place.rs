@@ -175,7 +175,7 @@ pub fn transform(body: &Body, place: &Placement) -> Option<Body> {
     }
     if place.reflects() {
         for face in out.faces.values_mut() {
-            if matches!(out.surfaces.get(face.surface), Some(Surface::Nurbs(_))) {
+            if out.surfaces.get(face.surface).is_some_and(Surface::is_spline) {
                 face.forward = !face.forward;
             }
         }
@@ -194,7 +194,7 @@ fn moved_pcurve(
         Surface::Plane(_) => [scale, handed * scale],
         Surface::Cylinder(_) | Surface::Cone(_) => [handed, scale],
         Surface::Sphere(_) | Surface::Torus(_) => [handed, 1.0],
-        Surface::Nurbs(_) => [1.0, 1.0],
+        Surface::Nurbs(_) | Surface::Offset(_) => [1.0, 1.0],
     };
     curve.transformed(&crate::geom2d::Transform::scale(factors[0], factors[1]))
 }
@@ -255,6 +255,13 @@ fn move_surface(surface: &Surface, place: &Placement, scale: f64) -> Option<Surf
             minor_radius: torus.minor_radius * scale,
         }),
         Surface::Nurbs(surface) => Surface::Nurbs(move_nurbs_surface(surface, place)?),
+        // A reflection turns the moved base's normal against the moved
+        // offset, so the distance changes sign with it.
+        Surface::Offset(offset) => Surface::Offset(super::geometry::OffsetSurface {
+            base: move_nurbs_surface(&offset.base, place)?,
+            distance: offset.distance * scale * if place.reflects() { -1.0 } else { 1.0 },
+            approximation: move_nurbs_surface(&offset.approximation, place)?,
+        }),
     })
 }
 

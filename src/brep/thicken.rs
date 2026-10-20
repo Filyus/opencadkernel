@@ -192,7 +192,9 @@ fn thicken_face(body: &Body, face_key: FaceKey, distance: f64) -> Result<Body, T
     let patch =
         rectangular_patch(body, face_key, surface).ok_or(ThickenError::UnsupportedSurface)?;
     match surface {
-        Surface::Nurbs(nurbs) => thicken_nurbs_patch(body, face_key, nurbs, oriented),
+        Surface::Nurbs(nurbs) | Surface::Offset(crate::brep::OffsetSurface { approximation: nurbs, .. }) => {
+            thicken_nurbs_patch(body, face_key, nurbs, oriented)
+        }
         _ => thicken_revolved_patch(surface, patch, oriented),
     }
 }
@@ -467,7 +469,9 @@ fn thicken_revolved_patch(
                 ),
             )
         }
-        Surface::Plane(_) | Surface::Nurbs(_) => return Err(ThickenError::UnsupportedSurface),
+        Surface::Plane(_) | Surface::Nurbs(_) | Surface::Offset(_) => {
+            return Err(ThickenError::UnsupportedSurface)
+        }
     };
 
     let radial = frame.vector_at([patch.u_start.cos(), patch.u_start.sin()]);
@@ -1336,7 +1340,7 @@ mod tests {
                 assert!(solid
                     .surfaces
                     .iter()
-                    .all(|(_, surface)| !matches!(surface, Surface::Nurbs(_))));
+                    .all(|(_, surface)| !surface.is_spline()));
                 assert!(mesh_body(&solid, 0.05, 1e-7).mass_properties().unwrap().0 > 0.0);
             }
         }
@@ -1366,7 +1370,7 @@ mod tests {
                 solid
                     .surfaces
                     .iter()
-                    .filter(|(_, surface)| matches!(surface, Surface::Nurbs(_)))
+                    .filter(|(_, surface)| surface.is_spline())
                     .count()
                     >= 2
             );

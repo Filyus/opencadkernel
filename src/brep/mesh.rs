@@ -1574,7 +1574,7 @@ fn shared_edge_samples(
         .collect::<Option<HashMap<_, _>>>()?;
     let has_nurbs_pcurve = edge.coedges.iter().any(|coedge| {
         coedge_geometry(body, *coedge).is_some_and(|(surface, pcurve)| {
-            matches!(surface, super::geometry::Surface::Nurbs(_)) && pcurve.is_some()
+            surface.is_spline() && pcurve.is_some()
         })
     });
     if has_nurbs_pcurve {
@@ -1624,7 +1624,7 @@ fn edge_samples_from_pcurves(
         let Some((surface, Some(pcurve))) = coedge_geometry(body, *coedge_key) else {
             continue;
         };
-        if !matches!(surface, super::geometry::Surface::Nurbs(_)) {
+        if !surface.is_spline() {
             continue;
         }
         let mut samples = Vec::new();
@@ -2003,7 +2003,7 @@ fn scheduled_face(
         if band.strip
             && band.holes.is_empty()
             && (band.structured
-                || (!matches!(surface, super::geometry::Surface::Nurbs(_))
+                || (!surface.is_spline()
                     && periods(surface)[1 - band.varying].is_none()
                     && zipped(&band.low)
                     && zipped(&band.high)))
@@ -2756,7 +2756,7 @@ fn scheduled_band(
             // pole, bounds nothing: the band closes across it. A spline
             // surface's seams keep to the general mesher, which reads one
             // the same however the file wrote it.
-            let seam = !matches!(surface, super::geometry::Surface::Nurbs(_))
+            let seam = !surface.is_spline()
                 && body.edges.get(coedge.edge).is_some_and(|edge| {
                     edge.coedges.len() == 2
                         && edge.coedges.iter().all(|other| {
@@ -3733,7 +3733,7 @@ fn surface_domain(surface: &super::geometry::Surface) -> Option<[[f64; 2]; 2]> {
             Some([[0.0, TAU], [0.0_f64.min(apex), 0.0_f64.max(apex)]])
         }
         Surface::Torus(_) => Some([[0.0, TAU], [0.0, TAU]]),
-        Surface::Nurbs(surface) => {
+        Surface::Nurbs(surface) | Surface::Offset(crate::brep::OffsetSurface { approximation: surface, .. }) => {
             let ((u0, u1), (v0, v1)) = surface.domain();
             Some([[u0, u1], [v0, v1]])
         }
@@ -3754,7 +3754,7 @@ fn whole_surface_domain(
     if !valid_domain {
         return None;
     }
-    let bounded_domain = matches!(surface, super::geometry::Surface::Nurbs(_))
+    let bounded_domain = surface.is_spline()
         && node.loops.as_slice().first().is_some_and(|loop_key| {
             let Some(ring) = body.loops.get(*loop_key) else {
                 return false;
@@ -3850,7 +3850,9 @@ fn whole_surface_domain(
     }
     let closed = match surface {
         super::geometry::Surface::Sphere(_) | super::geometry::Surface::Torus(_) => true,
-        super::geometry::Surface::Nurbs(surface) => surface.periodicity() == [true, true],
+        super::geometry::Surface::Nurbs(_) | super::geometry::Surface::Offset(_) => {
+            surface.spline().is_some_and(|s| s.periodicity() == [true, true])
+        }
         _ => false,
     };
     if !closed {
@@ -3894,7 +3896,7 @@ fn periods(surface: &super::geometry::Surface) -> [Option<f64>; 2] {
         Surface::Plane(_) => [None, None],
         Surface::Cylinder(_) | Surface::Cone(_) | Surface::Sphere(_) => [Some(TAU), None],
         Surface::Torus(_) => [Some(TAU), Some(TAU)],
-        Surface::Nurbs(surface) => {
+        Surface::Nurbs(surface) | Surface::Offset(crate::brep::OffsetSurface { approximation: surface, .. }) => {
             let ((u0, u1), (v0, v1)) = surface.domain();
             let periodic = surface.periodicity();
             [
@@ -4628,10 +4630,7 @@ fn surface_grid_values(
     bounds: [[f64; 2]; 2],
     max_angle: f64,
 ) -> Option<[Vec<f64>; 2]> {
-    let nurbs = match surface {
-        super::geometry::Surface::Nurbs(nurbs) => Some(nurbs),
-        _ => None,
-    };
+    let nurbs = surface.spline();
     let values = [0, 1].map(|axis| {
         let other = 1 - axis;
         // An analytic surface has no knots to probe at, and its bounds and
@@ -5140,7 +5139,7 @@ impl Drop for SplineNormals {
 /// Retain its parameter-dependent one-sided limit for display, without
 /// accepting singularities in the interior of a surface.
 fn surface_display_normal(surface: &super::geometry::Surface, uv: [f64; 2]) -> Option<[f64; 3]> {
-    if !matches!(surface, super::geometry::Surface::Nurbs(_)) {
+    if !surface.is_spline() {
         return display_normal(surface, uv);
     }
     let key = (surface as *const _ as usize, uv[0].to_bits(), uv[1].to_bits());
@@ -5164,7 +5163,7 @@ fn surface_frame(
     surface: &super::geometry::Surface,
     uv: [f64; 2],
 ) -> Option<([f64; 3], [f64; 3])> {
-    if !matches!(surface, super::geometry::Surface::Nurbs(_)) {
+    if !surface.is_spline() {
         return surface.tangents_at(uv[0], uv[1]);
     }
     let key = (surface as *const _ as usize, uv[0].to_bits(), uv[1].to_bits());
@@ -5184,7 +5183,7 @@ fn surface_frame(
 
 fn display_normal(surface: &super::geometry::Surface, uv: [f64; 2]) -> Option<[f64; 3]> {
     let direct = surface.normal_at(uv[0], uv[1]);
-    let super::geometry::Surface::Nurbs(nurbs) = surface else {
+    let Some(nurbs) = surface.spline() else {
         return direct;
     };
     let ((u0, u1), (v0, v1)) = nurbs.domain();

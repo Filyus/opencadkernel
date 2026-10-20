@@ -1589,7 +1589,7 @@ fn face_sense(surface: &Surface, on: [f64; 3], out: Vec3) -> Option<bool> {
         let slope = normal.dot(out);
         return (slope != 0.0 && slope.is_finite()).then_some(slope > 0.0);
     }
-    if let Surface::Nurbs(spline) = surface {
+    if let Some(spline) = surface.spline() {
         let ((u0, u1), (v0, v1)) = spline.domain();
         let normal = Vec3::from(surface.normal_at((u0 + u1) * 0.5, (v0 + v1) * 0.5)?);
         let slope = normal.dot(out);
@@ -3214,7 +3214,7 @@ fn revolve_part(
             PieceSurface::Unsupported => return None,
         };
         let next = (index + 1) % profile.len();
-        let spline = matches!(surface, Surface::Nurbs(_));
+        let spline = surface.is_spline();
         let revolved_arc = match (&surface, piece) {
             (Surface::Sphere(_) | Surface::Torus(_), Curve2::Arc(arc)) => {
                 Some(turn.revolved_arc_parameters(plane, arc)?)
@@ -3357,7 +3357,7 @@ fn revolve_surface_part(
             PieceSurface::Unsupported => return None,
         };
         let next = if closed { (index + 1) % corners.len() } else { index + 1 };
-        let spline = matches!(surface, Surface::Nurbs(_));
+        let spline = surface.is_spline();
         let revolved_arc = match (&surface, piece) {
             (Surface::Sphere(_) | Surface::Torus(_), Curve2::Arc(arc)) => {
                 Some(turn.revolved_arc_parameters(plane, arc)?)
@@ -3522,7 +3522,7 @@ fn revolve_whole(
             PieceSurface::Unsupported => return None,
         };
         let next = (index + 1) % count;
-        let spline = matches!(surface, Surface::Nurbs(_));
+        let spline = surface.is_spline();
         let revolved_arc = match (&surface, piece) {
             (Surface::Torus(_), Curve2::Arc(arc)) => {
                 Some(turn.revolved_arc_parameters(plane, arc)?)
@@ -3706,7 +3706,7 @@ fn revolve_surface_whole(
             PieceSurface::Unsupported => return None,
         };
         let next = if closed { (index + 1) % corner_count } else { index + 1 };
-        let spline = matches!(surface, Surface::Nurbs(_));
+        let spline = surface.is_spline();
         let revolved_arc = match (&surface, piece) {
             (Surface::Torus(_), Curve2::Arc(arc)) => {
                 Some(turn.revolved_arc_parameters(plane, arc)?)
@@ -4205,7 +4205,7 @@ mod tests {
         assert!(solid
             .surfaces
             .iter()
-            .any(|(_, surface)| matches!(surface, Surface::Nurbs(_))));
+            .any(|(_, surface)| surface.is_spline()));
     }
 
     #[test]
@@ -4525,7 +4525,7 @@ mod tests {
         assert!(solid
             .surfaces
             .iter()
-            .any(|(_, surface)| matches!(surface, Surface::Nurbs(_))));
+            .any(|(_, surface)| surface.is_spline()));
     }
 
     #[test]

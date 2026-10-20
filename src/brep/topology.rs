@@ -358,7 +358,9 @@ impl Body {
             let closed_surface = self.surfaces.get(face.surface).is_some_and(|surface| {
                 match surface {
                     Surface::Sphere(_) | Surface::Torus(_) => true,
-                    Surface::Nurbs(surface) => surface.periodicity() == [true, true],
+                    Surface::Nurbs(_) | Surface::Offset(_) => {
+                        surface.spline().is_some_and(|s| s.periodicity() == [true, true])
+                    }
                     _ => false,
                 }
             });

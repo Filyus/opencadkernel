@@ -800,7 +800,7 @@ fn upright_offset(
             }
             // A spline wall stands square where its normal does, all along
             // the edge.
-            wall @ Surface::Nurbs(_) => {
+            wall @ (Surface::Nurbs(_) | Surface::Offset(_)) => {
                 let curve = body.curves.get(edge.curve)?;
                 (0..=8).all(|step| {
                     let t = step as f64 / 8.0;

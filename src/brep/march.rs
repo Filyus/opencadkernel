@@ -68,7 +68,7 @@ pub(super) fn traced(
         // kept to where both bodies are, as far as anything can meet.
         // ponytail: spline walls only; closing a plane's loop round a torus
         // over-cut fillets that the clipped pieces divided fine.
-        let spline = matches!(one, Surface::Nurbs(_)) || matches!(other, Surface::Nurbs(_));
+        let spline = one.is_spline() || other.is_spline();
         let reach = if spline { around } else { common };
         let mut traced = walk(one, other, start, reach, size, tolerance)?;
         if !traced.closed {
@@ -363,7 +363,7 @@ fn heading(one: &Surface, other: &Surface, point: Vec3) -> Option<Vec3> {
 
 /// Whether `point` sits on the edge of a bounded spline surface's domain.
 fn at_domain_edge(surface: &Surface, point: Vec3) -> bool {
-    let Surface::Nurbs(nurbs) = surface else {
+    let Some(nurbs) = surface.spline() else {
         return false;
     };
     let Some((u, v)) = surface.parameters_at(point.to_array()) else {

@@ -44,6 +44,22 @@ pub enum Surface {
     Torus(Torus),
     /// A tensor-product spline surface in its knot parameters.
     Nurbs(NurbsSurface3),
+    /// A spline surface pushed along its own normal by a distance, kept as
+    /// such because ACIS stores it so (`offsur`): written back as a plain
+    /// spline it would lose what it was. Its parameters are the
+    /// approximation's, which every evaluation, mesh and intersection uses.
+    Offset(OffsetSurface),
+}
+
+/// A spline surface offset along its normal (`u × v`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OffsetSurface {
+    /// The surface offset.
+    pub base: NurbsSurface3,
+    /// The signed distance along the base's normal.
+    pub distance: f64,
+    /// A spline through the offset, in the base's parameters.
+    pub approximation: NurbsSurface3,
 }
 
 /// A right circular cylinder.
@@ -95,6 +111,22 @@ pub struct Torus {
 }
 
 impl Surface {
+    /// The spline a spline surface is evaluated through: its own, or an
+    /// offset's approximation.
+    pub fn spline(&self) -> Option<&NurbsSurface3> {
+        match self {
+            Self::Nurbs(surface) | Self::Offset(OffsetSurface { approximation: surface, .. }) => {
+                Some(surface)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the surface is a spline (an offset is one too).
+    pub fn is_spline(&self) -> bool {
+        self.spline().is_some()
+    }
+
     /// The point at surface parameters `(u, v)`.
     pub fn point_at(&self, u: f64, v: f64) -> [f64; 3] {
         match self {
@@ -122,7 +154,7 @@ impl Surface {
                 let around = torus.frame.point_at([ring * u.cos(), ring * u.sin()]);
                 offset_along_normal(&torus.frame, around, torus.minor_radius * v.sin())
             }
-            Self::Nurbs(surface) => surface.point_at_knot(u, v),
+            Self::Nurbs(surface) | Self::Offset(OffsetSurface { approximation: surface, .. }) => surface.point_at_knot(u, v),
         }
     }
 
@@ -169,7 +201,7 @@ impl Surface {
                     .to_array(),
                 ))
             }
-            Self::Nurbs(surface) => surface.tangents_at_knot(u, v),
+            Self::Nurbs(surface) | Self::Offset(OffsetSurface { approximation: surface, .. }) => surface.tangents_at_knot(u, v),
         }
     }
 
@@ -198,7 +230,7 @@ impl Surface {
                     .normalize()
                     .map(Vec3::to_array)
             }
-            Self::Nurbs(_) => {
+            Self::Nurbs(_) | Self::Offset(_) => {
                 let (along_u, along_v) = self.tangents_at(u, v)?;
                 Vec3::from(along_u)
                     .cross(Vec3::from(along_v))
@@ -218,7 +250,7 @@ impl Surface {
             Self::Cone(cone) => &cone.base,
             Self::Sphere(sphere) => &sphere.frame,
             Self::Torus(torus) => &torus.frame,
-            Self::Nurbs(_) => return None,
+            Self::Nurbs(_) | Self::Offset(_) => return None,
         })
     }
 
@@ -288,7 +320,7 @@ impl Surface {
                     Some(outer)
                 }
             }
-            Self::Nurbs(surface) => surface.parameters_at(point),
+            Self::Nurbs(surface) | Self::Offset(OffsetSurface { approximation: surface, .. }) => surface.parameters_at(point),
         }
     }
 
@@ -404,7 +436,7 @@ impl Surface {
                 }
                 Some(hits)
             }
-            Self::Nurbs(surface) => nurbs_ray_hits(surface, start, along),
+            Self::Nurbs(surface) | Self::Offset(OffsetSurface { approximation: surface, .. }) => nurbs_ray_hits(surface, start, along),
         }
     }
 
@@ -456,7 +488,7 @@ impl Surface {
             }
             // Unsigned off the patch's side, where the nearest point is on
             // its edge and the normal says nothing about the side.
-            Self::Nurbs(surface) => {
+            Self::Nurbs(surface) | Self::Offset(OffsetSurface { approximation: surface, .. }) => {
                 let Some((u, v)) = surface.parameters_at(point) else {
                     return f64::INFINITY;
                 };

@@ -64,7 +64,7 @@ pub fn slice_by_surface(body: &Body, cutter: &Body) -> Result<Option<PlaneSlice>
     let cutter_node = cutter.faces.get(cutter_face).ok_or(Snag::CutRefused)?;
     if matches!(
         cutter.surfaces.get(cutter_node.surface),
-        None | Some(super::Surface::Nurbs(_))
+        None | Some(super::Surface::Nurbs(_) | super::Surface::Offset(_))
     ) {
         return Err(Snag::NoClosedForm);
     }
@@ -139,7 +139,7 @@ pub fn surface_side(cutter: &Body, point: [f64; 3]) -> Option<f64> {
     let face = single_face(cutter)?;
     let node = cutter.faces.get(face)?;
     let surface = cutter.surfaces.get(node.surface)?;
-    (!matches!(surface, super::Surface::Nurbs(_)))
+    (!surface.is_spline())
         .then(|| surface.distance_to(point) * if node.forward { 1.0 } else { -1.0 })
 }
 

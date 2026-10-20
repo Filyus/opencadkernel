@@ -3,6 +3,7 @@
 //! Records are allocated before their circular topology pointers are filled.
 
 use opencadcodec::entities::acis::types::{SatDocument, SatPointer, SatRecord, SatToken};
+use opencadcodec::entities::acis::SplineNet;
 use crate::brep::{
     Body, CoedgeKey, Curve3, CurveKey, EdgeKey, FaceKey, LoopKey, LumpKey, ShellKey, Surface,
     SurfaceKey, VertexKey,
@@ -64,6 +65,7 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
     for (key, surface) in body.surfaces.iter() {
         let id = match surface {
             Surface::Nurbs(surface) => add_nurbs_surface(document, surface),
+            Surface::Offset(offset) => add_offset_surface(document, offset),
             _ => {
                 let (kind, tokens) = surface_record(surface).ok_or(Unappendable::Surface)?;
                 add(document, kind, tokens)
@@ -81,7 +83,7 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
                 .get(coedge.owner)
                 .and_then(|ring| body.faces.get(ring.owner))
                 .ok_or(Unappendable::Inconsistent)?;
-            let needs_curve = matches!(body.surfaces.get(face.surface), Some(Surface::Nurbs(_)));
+            let needs_curve = body.surfaces.get(face.surface).is_some_and(Surface::is_spline);
             // A pcurve that cannot be put in the edge's parameterisation (a
             // degenerate edge has no range to map onto) is written as it is,
             // as before, rather than refusing the whole body.
@@ -419,42 +421,97 @@ fn distinct_knots(knots: &[f64]) -> Vec<(f64, i32)> {
     out
 }
 
-fn add_nurbs_surface(document: &mut SatDocument, surface: &crate::space::NurbsSurface3) -> i32 {
-    let (u_degree, v_degree) = surface.degrees();
-    let (u_knots, v_knots) = surface.knots();
-    let controls = surface.control_points();
-    let weights = surface.weights();
-    let rational = weights
-        .iter()
-        .flatten()
-        .next()
-        .is_some_and(|first| {
-            weights
-                .iter()
-                .flatten()
-                .any(|weight| (*weight - *first).abs() > 1e-12)
-        });
-    let mut points = Vec::new();
-    let mut flat_weights = Vec::new();
-    for v in 0..controls[0].len() {
-        for u in 0..controls.len() {
-            points.push(controls[u][v]);
-            flat_weights.push(weights[u][v]);
+/// A spline's control net laid out as ACIS takes it: distinct knots with
+/// their multiplicities, control points v-major, weights only when they vary.
+struct Net {
+    rational: bool,
+    degrees: (i32, i32),
+    periodic: [bool; 2],
+    u_knots: Vec<(f64, i32)>,
+    v_knots: Vec<(f64, i32)>,
+    points: Vec<[f64; 3]>,
+    weights: Vec<f64>,
+}
+
+impl Net {
+    fn of(surface: &crate::space::NurbsSurface3) -> Self {
+        let (u_degree, v_degree) = surface.degrees();
+        let (u_knots, v_knots) = surface.knots();
+        let controls = surface.control_points();
+        let weights = surface.weights();
+        let rational = weights
+            .iter()
+            .flatten()
+            .next()
+            .is_some_and(|first| {
+                weights
+                    .iter()
+                    .flatten()
+                    .any(|weight| (*weight - *first).abs() > 1e-12)
+            });
+        let mut points = Vec::new();
+        let mut flat_weights = Vec::new();
+        for v in 0..controls[0].len() {
+            for u in 0..controls.len() {
+                points.push(controls[u][v]);
+                flat_weights.push(weights[u][v]);
+            }
+        }
+        Self {
+            rational,
+            degrees: (u_degree as i32, v_degree as i32),
+            periodic: surface.periodicity(),
+            u_knots: distinct_knots(u_knots),
+            v_knots: distinct_knots(v_knots),
+            points,
+            weights: flat_weights,
         }
     }
-    let periodic = surface.periodicity();
+
+    fn view(&self) -> SplineNet<'_> {
+        SplineNet {
+            rational: self.rational,
+            deg_u: self.degrees.0,
+            deg_v: self.degrees.1,
+            u_closed: self.periodic[0],
+            v_closed: self.periodic[1],
+            u_knots: &self.u_knots,
+            v_knots: &self.v_knots,
+            control: &self.points,
+            weights: self.rational.then_some(self.weights.as_slice()),
+            fit_tol: 0.0,
+        }
+    }
+}
+
+fn add_nurbs_surface(document: &mut SatDocument, surface: &crate::space::NurbsSurface3) -> i32 {
+    let net = Net::of(surface);
+    let view = net.view();
     document.add_spline_surface(
         surface.v_reversed(),
-        rational,
-        u_degree as i32,
-        v_degree as i32,
-        periodic[0],
-        periodic[1],
-        &distinct_knots(u_knots),
-        &distinct_knots(v_knots),
-        &points,
-        rational.then_some(flat_weights.as_slice()),
-        0.0,
+        view.rational,
+        view.deg_u,
+        view.deg_v,
+        view.u_closed,
+        view.v_closed,
+        view.u_knots,
+        view.v_knots,
+        view.control,
+        view.weights,
+        view.fit_tol,
+    )
+}
+
+/// An offset surface as its ACIS 7 `offsur` record: the base, the distance
+/// and the approximation the kernel evaluates.
+fn add_offset_surface(document: &mut SatDocument, offset: &crate::brep::OffsetSurface) -> i32 {
+    let (base, approximation) = (Net::of(&offset.base), Net::of(&offset.approximation));
+    document.add_offset_spline_surface(
+        offset.approximation.v_reversed(),
+        offset.base.v_reversed(),
+        &base.view(),
+        offset.distance,
+        &approximation.view(),
     )
 }
 
@@ -642,7 +699,7 @@ pub(super) fn surface_record(surface: &Surface) -> Option<(&'static str, Vec<Sat
                 position(u),
             ],
         ),
-        Surface::Nurbs(_) => return None,
+        Surface::Nurbs(_) | Surface::Offset(_) => return None,
     })
 }
 

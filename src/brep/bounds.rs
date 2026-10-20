@@ -122,7 +122,7 @@ pub fn face_bounds(body: &Body, face: FaceKey) -> Option<Aabb> {
             });
             return centred_bounds(torus.frame.origin, extent);
         }
-        Surface::Nurbs(surface) => {
+        Surface::Nurbs(surface) | Surface::Offset(crate::brep::OffsetSurface { approximation: surface, .. }) => {
             // Positive rational weights keep the surface inside its control hull.
             if surface.weights().iter().flatten().any(|w| !w.is_finite() || *w <= 0.0)
                 || surface.control_points().iter().flatten().flatten().any(|v| !v.is_finite()) {
@@ -368,7 +368,7 @@ mod tests {
             let bounds = face_bounds(&body, face).unwrap().grown(1e-12);
             for i in 0..=32 {
                 for j in 0..=32 {
-                    let (u, v) = if matches!(surface, Surface::Nurbs(_)) {
+                    let (u, v) = if surface.is_spline() {
                         (i as f64 / 32.0, j as f64 / 32.0)
                     } else {
                         (i as f64 * std::f64::consts::TAU / 32.0, j as f64 * std::f64::consts::TAU / 32.0)

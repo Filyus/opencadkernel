@@ -487,7 +487,7 @@ fn curve_of(
 }
 
 fn surface_curve(surface: &Surface, pcurve: &Curve2) -> Option<Curve3> {
-    let Surface::Nurbs(surface) = surface else {
+    let Some(surface) = surface.spline() else {
         return None;
     };
     let ((u0, u1), (v0, v1)) = surface.domain();
@@ -934,14 +934,27 @@ fn read_surface(document: &SatDocument, record: &SatRecord) -> Option<Surface> {
     }
     if let Some(spline) = SatSplineSurface::from_record(record) {
         let reversed = spline.sense() == Sense::Reversed;
+        // An offset keeps its base and distance; its saved spline is the
+        // approximation (rebuilt from the base when the file has none).
+        let offset = spline
+            .offset_in(document)
+            .and_then(|(base, distance)| Some((nurbs_surface(base)?, distance)));
         let surface = match spline.bspline(document) {
             Some(fitted) => nurbs_surface(fitted)?,
             None => {
-                let (base, distance) = spline.offset_in(document)?;
-                offset_surface(&nurbs_surface(base)?, distance)?
+                let (base, distance) = offset.as_ref()?;
+                offset_surface(base, *distance)?
             }
         };
-        return Some(Surface::Nurbs(surface.with_v_reversed(reversed)));
+        let surface = surface.with_v_reversed(reversed);
+        return Some(match offset {
+            Some((base, distance)) => Surface::Offset(crate::brep::OffsetSurface {
+                base,
+                distance,
+                approximation: surface,
+            }),
+            None => Surface::Nurbs(surface),
+        });
     }
     None
 }

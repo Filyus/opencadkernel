@@ -225,7 +225,7 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
             }
             _ => None,
         },
-        Surface::Nurbs(_) => None,
+        Surface::Nurbs(_) | Surface::Offset(_) => None,
     }
 }
 
@@ -737,7 +737,7 @@ pub(crate) fn periods(surface: &Surface) -> [Option<f64>; 2] {
         Surface::Plane(_) => [None, None],
         Surface::Cylinder(_) | Surface::Cone(_) | Surface::Sphere(_) => [Some(TAU), None],
         Surface::Torus(_) => [Some(TAU), Some(TAU)],
-        Surface::Nurbs(surface) => {
+        Surface::Nurbs(surface) | Surface::Offset(crate::brep::OffsetSurface { approximation: surface, .. }) => {
             let ((u0, u1), (v0, v1)) = surface.domain();
             let periodic = surface.periodicity();
             [
@@ -1219,7 +1219,7 @@ fn fit_allowance(
     points: &[[f64; 3]],
     tolerance: f64,
 ) -> f64 {
-    if !matches!(curve, Curve3::Nurbs(_)) && !matches!(surface, Surface::Nurbs(_)) {
+    if !matches!(curve, Curve3::Nurbs(_)) && !surface.is_spline() {
         return tolerance;
     }
     let first = Vec3::from(points[0]);

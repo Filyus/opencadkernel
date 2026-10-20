@@ -544,7 +544,7 @@ fn sweep_path_lifted(
     if options.twist.abs() <= 1e-12 && (options.scale - 1.0).abs() <= 1e-12 {
         let mut exact = build_body(&wires, &patches, sheet, closed, outward)?;
         let all_analytic = |body: &Body| body.faces.iter().all(|(_, face)|
-            !matches!(body.surfaces.get(face.surface), Some(Surface::Nurbs(_))));
+            !body.surfaces.get(face.surface).is_some_and(Surface::is_spline));
         if analytic_ruled_faces(&mut exact).is_some() && exact.validate().is_empty() && all_analytic(&exact) {
             return Some(exact);
         }
