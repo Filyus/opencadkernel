@@ -1337,8 +1337,11 @@ fn face_isolines(
                 end[fixed_axis] = fixed;
                 end[varying_axis] = interval[1];
                 points.push(surface.point_at(end[0], end[1]));
+                // A solid's line at its surface's zero angle may lie on the
+                // face's seam, which is not drawn: it is kept there.
                 if points.len() >= 2
-                    && !polyline_on_face_boundary(body, face, &points, tolerance, schedules)
+                    && (solid_isolines
+                        || !polyline_on_face_boundary(body, face, &points, tolerance, schedules))
                 {
                     out.push(FacePolyline {
                         face,
