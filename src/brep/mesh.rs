@@ -1370,7 +1370,8 @@ fn solid_isoline_values(
             .collect()
     };
     match (surface, axis) {
-        (Surface::Cylinder(_) | Surface::Cone(_) | Surface::Sphere(_), 0) | (Surface::Torus(_), _) => {
+        (Surface::Cylinder(_) | Surface::Cone(_) | Surface::Sphere(_), 0)
+        | (Surface::Torus(_), _) => {
             let turn = std::f64::consts::TAU;
             if span >= turn - 1e-9 {
                 (0..count)
