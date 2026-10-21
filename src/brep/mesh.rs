@@ -277,6 +277,7 @@ pub struct TessellationTolerance {
     chordal: Option<f64>,
     isolines: [usize; 2],
     planar_isolines: bool,
+    solid_isolines: bool,
 }
 
 impl TessellationTolerance {
@@ -287,6 +288,7 @@ impl TessellationTolerance {
             chordal: None,
             isolines: [0; 2],
             planar_isolines: false,
+            solid_isolines: false,
         }
     }
 
@@ -304,6 +306,20 @@ impl TessellationTolerance {
     /// parameter axes. The first count fixes U while the second fixes V.
     pub fn with_uv_isolines(mut self, u_count: usize, v_count: usize) -> Self {
         self.isolines = [u_count, v_count];
+        self
+    }
+
+    /// Construction lines spaced as a solid draws them, `count` being the
+    /// drawing's isoline setting (planes get none, other curved surfaces
+    /// evenly spaced lines).
+    /// Round the axis, a face going all the way round gets `count` lines a
+    /// whole turn over `count` apart from the surface's zero angle, and a face
+    /// covering part of a turn is cut into `count` times that part (rounded,
+    /// plus one) equal pieces. A sphere's latitude span is cut into `count`
+    /// equal pieces; cylinders and cones get no lines across their axis.
+    pub fn with_solid_isolines(mut self, count: usize) -> Self {
+        self.isolines = [count; 2];
+        self.solid_isolines = true;
         self
     }
 
@@ -954,6 +970,7 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
                         tolerance.linear,
                         tolerance.isolines,
                         tolerance.planar_isolines,
+                        tolerance.solid_isolines,
                         &schedules,
                     ) {
                         Some(lines) => out.isolines.extend(lines),
@@ -1001,6 +1018,7 @@ pub fn tessellate_wireframe(body: &Body, tolerance: TessellationTolerance) -> Bo
                 tolerance.linear,
                 tolerance.isolines,
                 tolerance.planar_isolines,
+                tolerance.solid_isolines,
                 &schedules,
             ) {
                 Some(lines) => out.isolines.extend(lines),
@@ -1254,6 +1272,7 @@ fn face_isolines(
     tolerance: f64,
     counts: [usize; 2],
     planar_isolines: bool,
+    solid_isolines: bool,
     schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
 ) -> Option<Vec<FacePolyline>> {
     let Some(node) = body.faces.get(face) else {
@@ -1287,9 +1306,17 @@ fn face_isolines(
         if fixed_span <= 0.0 {
             continue;
         }
-        for index in 0..count {
-            let fixed =
-                bounds[fixed_axis][0] + fixed_span * (index as f64 + 1.0) / (count as f64 + 1.0);
+        let values = if solid_isolines {
+            solid_isoline_values(surface, fixed_axis, bounds[fixed_axis], count)
+        } else {
+            (0..count)
+                .map(|index| {
+                    bounds[fixed_axis][0]
+                        + fixed_span * (index as f64 + 1.0) / (count as f64 + 1.0)
+                })
+                .collect()
+        };
+        for fixed in values {
             for interval in line_intervals(&parameters, fixed_axis, fixed) {
                 let mut points = Vec::new();
                 let mut budget = PCURVE_REFINE_BUDGET;
@@ -1322,6 +1349,42 @@ fn face_isolines(
         }
     }
     Some(out)
+}
+
+/// Where a solid draws its `count` construction lines fixing `axis` of a
+/// face spanning `range` (see [`TessellationTolerance::with_solid_isolines`]).
+fn solid_isoline_values(
+    surface: &super::geometry::Surface,
+    axis: usize,
+    range: [f64; 2],
+    count: usize,
+) -> Vec<f64> {
+    use super::geometry::Surface;
+    let span = range[1] - range[0];
+    let pieces = |parts: usize| -> Vec<f64> {
+        (1..parts)
+            .map(|index| range[0] + span * index as f64 / parts as f64)
+            .collect()
+    };
+    match (surface, axis) {
+        (Surface::Cylinder(_) | Surface::Cone(_) | Surface::Sphere(_), 0) | (Surface::Torus(_), _) => {
+            let turn = std::f64::consts::TAU;
+            if span >= turn - 1e-9 {
+                (0..count)
+                    .map(|index| {
+                        range[0] + (turn * index as f64 / count as f64 - range[0]).rem_euclid(turn)
+                    })
+                    .collect()
+            } else {
+                pieces((count as f64 * span / turn + 0.5).floor() as usize + 1)
+            }
+        }
+        (Surface::Sphere(_), _) => pieces(count),
+        (Surface::Cylinder(_) | Surface::Cone(_), _) => Vec::new(),
+        _ => (0..count)
+            .map(|index| range[0] + span * (index as f64 + 1.0) / (count as f64 + 1.0))
+            .collect(),
+    }
 }
 
 fn polyline_on_face_boundary(
