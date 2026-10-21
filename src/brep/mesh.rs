@@ -3357,7 +3357,7 @@ fn scheduled_winding_band(
     if node.loops.len() < 2 {
         return None;
     }
-    let rings: Vec<Vec<BoundaryPoint>> = node
+    let mut rings: Vec<Vec<BoundaryPoint>> = node
         .loops
         .iter()
         .map(|loop_key| {
@@ -3365,6 +3365,9 @@ fn scheduled_winding_band(
                 .then(|| scheduled_loop(body, *loop_key, surface, schedules, tolerance))?
         })
         .collect::<Option<_>>()?;
+    // A slit loop cancels to no points and bounds no area: skip it, as the
+    // other scheduled meshers do, rather than measure a ring with no ends.
+    rings.retain(|ring| ring.len() >= 3);
     let surface_periods = periods(surface);
     for varying in 0..2 {
         let Some(period) = surface_periods[varying] else {
