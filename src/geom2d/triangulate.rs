@@ -137,11 +137,13 @@ pub fn nesting_depths(input: &[Vec<[f64; 2]>]) -> Vec<usize> {
 /// Triangulates rings using even-odd containment.
 ///
 /// Disjoint outer rings, holes, and nested islands may be mixed in any order.
-/// Invalid intersecting components are omitted.
+/// Simple rings whose boundaries cross each other fill their even-odd region
+/// (see [`uncross`]); self-crossing rings and what they touch are omitted.
 pub fn rings(input: &[Vec<[f64; 2]>]) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
+    let input = uncross(input);
     let mut rings = Vec::new();
     let mut invalid = Vec::new();
-    for raw in input {
+    for raw in &input {
         let points = sanitize(raw);
         let Some(bounds) = RingBounds::of(&points) else {
             continue;
@@ -440,6 +442,95 @@ fn simple(ring: &[[f64; 2]], tolerance: f64) -> bool {
         }
     }
     true
+}
+
+/// Each group of simple rings whose boundaries cross, replaced by the faces
+/// of their arrangement that an odd number of them cover: the region they
+/// fill under the even-odd rule, as rings that at most touch. A hatch whose
+/// loops were stretched across each other keeps its fill instead of losing
+/// it. Other rings pass through unchanged.
+fn uncross(input: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
+    use super::{bounded_faces, Line, Tolerance};
+    let rings: Vec<Vec<[f64; 2]>> = input.iter().map(|ring| sanitize(ring)).collect();
+    let bounds: Vec<Option<RingBounds>> = rings
+        .iter()
+        .map(|ring| RingBounds::of(ring).filter(|_| ring.len() >= 3 && simple(ring, 0.0)))
+        .collect();
+    let root = |group: &[usize], mut index: usize| {
+        while group[index] != index {
+            index = group[index];
+        }
+        index
+    };
+    let mut group: Vec<usize> = (0..rings.len()).collect();
+    for first in 0..rings.len() {
+        for second in first + 1..rings.len() {
+            let (Some(a), Some(b)) = (bounds[first], bounds[second]) else {
+                continue;
+            };
+            if a.overlaps(b) && ring_boundaries_properly_cross(&rings[first], &rings[second]) {
+                let (a, b) = (root(&group, first), root(&group, second));
+                group[a.max(b)] = a.min(b);
+            }
+        }
+    }
+    let roots: Vec<usize> = (0..rings.len()).map(|index| root(&group, index)).collect();
+    if roots.iter().enumerate().all(|(index, root)| index == *root) {
+        return input.to_vec();
+    }
+    let roots = &roots;
+    let members = |root: usize| (0..rings.len()).filter(move |index| roots[*index] == root);
+    let mut out: Vec<Vec<[f64; 2]>> = input
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| members(roots[*index]).count() == 1)
+        .map(|(_, ring)| ring.clone())
+        .collect();
+    for root in (0..rings.len()).filter(|index| roots[*index] == *index) {
+        let group: Vec<usize> = members(root).collect();
+        if group.len() < 2 {
+            continue;
+        }
+        let lines: Vec<Line> = group
+            .iter()
+            .flat_map(|&index| {
+                let ring = &rings[index];
+                (0..ring.len()).map(move |k| Line {
+                    start: ring[k],
+                    end: ring[(k + 1) % ring.len()],
+                })
+            })
+            .collect();
+        let extent = group
+            .iter()
+            .filter_map(|index| bounds[*index])
+            .map(|b| (b.max - b.min).length())
+            .fold(0.0, f64::max);
+        if !(extent > 0.0) {
+            continue;
+        }
+        for face in bounded_faces(&lines, Tolerance::new(extent * 1e-9)) {
+            let (points, triangles) = polygon(&face, &[]);
+            let corners = |t: &[usize; 3]| t.map(|vertex| Vec2::from(points[vertex]));
+            let area = |[a, b, c]: [Vec2; 3]| (b - a).cross(c - a).abs();
+            let Some([a, b, c]) = triangles
+                .iter()
+                .map(corners)
+                .max_by(|p, q| area(*p).total_cmp(&area(*q)))
+            else {
+                continue;
+            };
+            let sample = ((a + b + c) * (1.0 / 3.0)).to_array();
+            let cover = group
+                .iter()
+                .filter(|index| ring_contains(&rings[**index], sample))
+                .count();
+            if cover % 2 == 1 {
+                out.push(face);
+            }
+        }
+    }
+    out
 }
 
 fn ring_boundaries_intersect(first: &[[f64; 2]], second: &[[f64; 2]]) -> bool {
@@ -1407,6 +1498,22 @@ mod tests {
                 || (centre.x <= 4.0 && centre.y <= 10.0);
             assert!(inside_l && centre.x >= 0.0 && centre.y >= 0.0, "{centre:?}");
         }
+    }
+
+    #[test]
+    fn crossing_rings_fill_their_even_odd_region() {
+        // Two 4x4 squares overlapping by 2x2: the overlap is left empty and
+        // the rest filled, instead of both rings being dropped.
+        let square = |x: f64, y: f64| vec![[x, y], [x + 4.0, y], [x + 4.0, y + 4.0], [x, y + 4.0]];
+        let (points, triangles) = rings(&[square(0.0, 0.0), square(2.0, 2.0)]);
+        let area: f64 = triangles
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|vertex| Vec2::from(points[vertex]));
+                (b - a).cross(c - a).abs() / 2.0
+            })
+            .sum();
+        assert!((area - 24.0).abs() < 1e-9, "{area}");
     }
 
     #[test]
