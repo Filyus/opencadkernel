@@ -42,7 +42,7 @@ pub mod transform;
 pub mod vec;
 
 pub use angle::{angle_within_arc, arc_parameter, arc_span, normalize_angle};
-pub use arrangement::{bounded_faces, segment_crossing, signed_area, SegmentCrossing};
+pub use arrangement::{bounded_faces, gap_bridges, segment_crossing, signed_area, SegmentCrossing};
 pub use band::{
     polyline_band_boundary, BandBoundaryEdge, BandStationPiece, PolylineBandBoundary,
 };

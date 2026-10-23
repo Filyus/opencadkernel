@@ -93,6 +93,92 @@ pub fn bounded_faces(segments: &[Line], tolerance: Tolerance) -> Vec<Vec<[f64; 2
     graph.trace_faces()
 }
 
+/// Straight bridges that close small gaps between loose segment ends, for
+/// a boundary search that should treat a nearly closed outline as closed.
+///
+/// An end is loose when no other segment passes within `tolerance` of it.
+/// Loose ends of different segments at most `gap` apart are joined, the
+/// closest pairs first, each end at most once. Returns only the bridges;
+/// pass them to [`bounded_faces`] together with `segments`. A segment that
+/// stops short of the middle of another (a T gap) gets no bridge.
+// ponytail: the loose-end test scans every segment, O(ends × segments);
+// index the segments by cell if very large drawings make it matter.
+pub fn gap_bridges(segments: &[Line], gap: f64, tolerance: Tolerance) -> Vec<Line> {
+    let weld = tolerance.linear();
+    if !(gap > weld) || !gap.is_finite() {
+        return Vec::new();
+    }
+    type Grid = HashMap<(i64, i64), Vec<usize>>;
+    let cell = |p: [f64; 2]| ((p[0] / gap).floor() as i64, (p[1] / gap).floor() as i64);
+    let around = |grid: &Grid, p: [f64; 2]| {
+        let (x, y) = cell(p);
+        (x - 1..=x + 1)
+            .flat_map(move |x| (y - 1..=y + 1).map(move |y| (x, y)))
+            .filter_map(|key| grid.get(&key))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    let distance = |a: [f64; 2], b: [f64; 2]| Vec2::from(a).distance(Vec2::from(b));
+    // Segment end `k` is `segments[k / 2]`, its start when `k` is even.
+    let end = |k: usize| {
+        let segment = segments[k / 2];
+        if k % 2 == 0 {
+            segment.start
+        } else {
+            segment.end
+        }
+    };
+    let mut ends = Grid::default();
+    for k in 0..segments.len() * 2 {
+        ends.entry(cell(end(k))).or_default().push(k);
+    }
+    let loose: Vec<usize> = (0..segments.len() * 2)
+        .filter(|&k| {
+            let p = end(k);
+            // Cheap test first: most ends meet another segment's end.
+            !around(&ends, p)
+                .into_iter()
+                .any(|other| other / 2 != k / 2 && distance(p, end(other)) <= weld)
+                && !segments.iter().enumerate().any(|(index, segment)| {
+                    index != k / 2
+                        && Vec2::from(p)
+                            .distance_to_segment(Vec2::from(segment.start), Vec2::from(segment.end))
+                            <= weld
+                })
+        })
+        .collect();
+    let mut loose_grid = Grid::default();
+    for (index, &k) in loose.iter().enumerate() {
+        loose_grid.entry(cell(end(k))).or_default().push(index);
+    }
+    let mut pairs = Vec::new();
+    for (a, &k) in loose.iter().enumerate() {
+        for b in around(&loose_grid, end(k)) {
+            let length = distance(end(k), end(loose[b]));
+            if b > a && loose[b] / 2 != k / 2 && length <= gap {
+                pairs.push((length, a, b));
+            }
+        }
+    }
+    pairs.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let mut bridged = vec![false; loose.len()];
+    pairs
+        .into_iter()
+        .filter_map(|(_, a, b)| {
+            if bridged[a] || bridged[b] {
+                return None;
+            }
+            bridged[a] = true;
+            bridged[b] = true;
+            Some(Line {
+                start: end(loose[a]),
+                end: end(loose[b]),
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct TaggedLine {
     pub line: Line,
@@ -639,6 +725,25 @@ fn weld_point(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gap_bridges_close_only_gaps_within_reach() {
+        // A square whose top-left corner is open by 0.5.
+        let line = |start: [f64; 2], end: [f64; 2]| Line { start, end };
+        let square = [
+            line([0.0, 0.0], [10.0, 0.0]),
+            line([10.0, 0.0], [10.0, 10.0]),
+            line([10.0, 10.0], [0.5, 10.0]),
+            line([0.0, 10.0], [0.0, 0.0]),
+        ];
+        let tolerance = Tolerance::new(1e-6);
+        assert!(gap_bridges(&square, 0.4, tolerance).is_empty());
+        let bridges = gap_bridges(&square, 0.6, tolerance);
+        assert_eq!(bridges.len(), 1);
+        let mut closed = square.to_vec();
+        closed.extend(bridges);
+        assert_eq!(bounded_faces(&closed, tolerance).len(), 1);
+    }
 
     fn tol() -> Tolerance {
         Tolerance::new(1.0e-6)
