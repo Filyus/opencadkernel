@@ -4930,6 +4930,19 @@ fn triangle_refinement(
         }
         return Some(TriangleRefinement::Interior(middle));
     }
+    // Within tolerance in space the triangle is complete, as the edge test
+    // above already treats its edges. Near a pole -- a surface edge collapsed
+    // to a point -- the normal turns around the apex at any scale, so without
+    // this floor the triangles there are split at their centroids until
+    // MAX_FACE_ADDITIONS and the face is lost.
+    if edge_vertices.iter().all(|[from, to]| {
+        distance3(
+            surface.point_at(corners[*from][0], corners[*from][1]),
+            surface.point_at(corners[*to][0], corners[*to][1]),
+        ) <= tolerance
+    }) {
+        return Some(TriangleRefinement::Complete);
+    }
     match surface_triangle_angle_cached(surface, corners, normal_cache) {
         Some(angle) if !angle_exceeds(angle, max_angle) => Some(TriangleRefinement::Complete),
         Some(_) => Some(TriangleRefinement::Interior([
@@ -5522,6 +5535,51 @@ mod tests {
     use crate::space::Plane;
 
     const TOL: f64 = 1e-9;
+
+    /// A spline cone: the v = 0 edge of the net collapsed to one apex point,
+    /// the v = 1 edge a quadratic ring around it.
+    fn spline_cone() -> Surface {
+        let apex = [0.0, 0.0, 1.0];
+        let ring = [
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+        ];
+        let net = ring.iter().map(|rim| vec![apex, *rim]).collect();
+        Surface::Nurbs(crate::space::NurbsSurface3::new(2, 1, net, vec![], vec![], None).unwrap())
+    }
+
+    fn refine(corners: [[f64; 2]; 3]) -> TriangleRefinement {
+        let triangle = crate::geom2d::constrained::ConstrainedTriangle {
+            parameters: corners,
+            constraints: [false; 3],
+        };
+        let mut cache = ParameterMap::default();
+        triangle_refinement(
+            &spline_cone(),
+            &triangle,
+            15f64.to_radians(),
+            1e-3,
+            &mut cache,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_triangle_at_a_pole_within_tolerance_is_complete() {
+        // At the apex the normal turns with u however small the triangle,
+        // so only its size in space can settle it.
+        let at_pole = refine([[0.2, 0.0], [0.8, 0.0], [0.5, 1e-7]]);
+        assert!(matches!(at_pole, TriangleRefinement::Complete));
+    }
+
+    #[test]
+    fn a_triangle_away_from_the_pole_is_still_refined() {
+        let away = refine([[0.2, 0.4], [0.8, 0.4], [0.5, 0.6]]);
+        assert!(matches!(away, TriangleRefinement::Interior(_)));
+    }
 
     #[test]
     fn mesh_mass_properties_preserve_translation_and_orientation() {
